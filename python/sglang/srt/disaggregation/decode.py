@@ -1118,7 +1118,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
-            decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
+            decode_req.req.time_stats.set_decode_transfer_queue_entry_time(
+                trace_attrs={
+                    "kv.allocated_tokens": int(decode_req.req.kv_allocated_len),
+                },
+            )
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
