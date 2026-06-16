@@ -1439,10 +1439,53 @@ class MooncakeKVManager(CommonKVManager):
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
 
             except Exception as e:
-                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
-                raise RuntimeError(
-                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
+                # Upstream originally re-raised this as RuntimeError, killing the
+                # daemon transfer_worker thread while leaving the main Python
+                # process (and its HTTP /health endpoint) running. Kubernetes
+                # would not restart the pod, but every subsequent KV transfer
+                # routed to it would hang until the decode side hit the 90s
+                # SGLANG_DISAGGREGATION_WAITING_TIMEOUT and returned 500.
+                #
+                # Instead: log the full traceback, fail the in-flight request
+                # the same way the `ret != 0` path does (so the decode gets a
+                # KVPoll.Failed notification in <1s), and continue the loop so
+                # the thread stays alive for other requests.
+                #
+                # NOTE: we deliberately do NOT blacklist the mooncake_session_id
+                # here — this exception indicates a prefill-side bug, not a
+                # dead peer, and blacklisting would poison the session for
+                # every future request to that decode.
+                logger.exception(
+                    "Transfer thread caught unexpected exception for room=%s on "
+                    "bootstrap_port=%s; failing this request and continuing.",
+                    getattr(kv_chunk, "room", "<unknown>"),
+                    self.bootstrap_port,
                 )
+                try:
+                    room = getattr(kv_chunk, "room", None)
+                    if room is not None and room in self.transfer_infos:
+                        self.record_failure(
+                            room,
+                            f"Prefill transfer thread raised unexpected exception: {e}",
+                        )
+                        self.update_status(room, KVPoll.Failed)
+                        for failed_req in self.transfer_infos[room].values():
+                            if failed_req.is_dummy:
+                                continue
+                            self.sync_status_to_decode_endpoint(
+                                failed_req.endpoint,
+                                failed_req.dst_port,
+                                failed_req.room,
+                                KVPoll.Failed,
+                                prefill_unique_rank,
+                            )
+                        self.transfer_infos.pop(room, None)
+                except Exception:
+                    logger.exception(
+                        "Secondary failure while reporting KVPoll.Failed for room=%s",
+                        getattr(kv_chunk, "room", "<unknown>"),
+                    )
+                continue
 
     def start_prefill_thread(self):
         def bootstrap_thread():
