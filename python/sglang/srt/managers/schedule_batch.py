@@ -1625,12 +1625,22 @@ def release_req(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
-) -> None:
+) -> bool:
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
 
+    offload_ok = True
     if server_args.disaggregation_mode == "decode":
-        req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+        try:
+            req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+        except NotImplementedError:
+            # CF INCIDENT-2000178: hybrid-SWA KV pools (e.g. DeepSeek-V4)
+            # do not implement get_cpu_copy, so a retracted decode request's
+            # KV cannot be offloaded to host for resume. This used to raise
+            # straight out of the scheduler event loop and kill the process
+            # on every TP rank under decode memory pressure. Swallow it and
+            # report failure to the caller, which aborts the request.
+            offload_ok = False
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, is_insert=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
@@ -1638,6 +1648,7 @@ def release_req(
     evict_from_tree_cache(tree_cache, num_tokens)
 
     req.reset_for_retract()
+    return offload_ok
 
 
 def retract_all(
@@ -2536,6 +2547,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         retracted_reqs = []
+        reqs_to_abort: List[Req] = []
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
@@ -2547,11 +2559,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
-            retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
-            self.release_req(idx, len(sorted_indices), server_args)
+            offload_ok = self.release_req(idx, len(sorted_indices), server_args)
+            if offload_ok:
+                retracted_reqs.append(req)
+            else:
+                # CF INCIDENT-2000178: this request's KV could not be offloaded
+                # to host (hybrid-SWA pools have no get_cpu_copy), so it cannot
+                # be resumed later. Abort it gracefully instead of crashing the
+                # scheduler; release_req has already freed its GPU KV.
+                req.to_finish = FINISH_ABORT(
+                    "KV offload on retract is unsupported for this model's KV "
+                    "pool; aborting request under decode memory pressure.",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                reqs_to_abort.append(req)
 
-        reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
@@ -2580,7 +2603,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
-        release_req(
+        return release_req(
             req=self.reqs[idx],
             remaing_req_count=remaing_req_count,
             server_args=server_args,
