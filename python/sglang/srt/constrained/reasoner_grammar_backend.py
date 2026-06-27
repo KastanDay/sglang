@@ -120,6 +120,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         if self._is_generation() and self.grammar is not None:
             self.grammar.accept_token(token)
         self.transfer_state(token)
+        self.current_token = token
 
     def is_terminated(self):
         if self.grammar is not None:
