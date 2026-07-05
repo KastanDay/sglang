@@ -3682,15 +3682,44 @@ def configure_gc_warning(warn_threshold_secs: float = 0.0, enable_metrics: bool 
     import gc
 
     if enable_metrics:
+        from collections import deque
+
         from prometheus_client import Histogram
+
         gc_pause_histogram = Histogram(
             name="sglang:gc_pause_duration_seconds",
             documentation="Duration of CPython gc.collect() pauses, by generation.",
             labelnames=["generation"],
             buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0),
         )
+
+        # Do NOT record the metric from inside the gc.callbacks hook. gc can fire
+        # while another thread holds prometheus_client's non-reentrant multiprocess
+        # lock (e.g. mid MmapedValue init, whose mmap_key does json.dumps and can
+        # trigger gc); observing here would re-acquire that same lock on the same
+        # thread -> permanent self-deadlock, freezing the event loop. Append to a
+        # lock-free deque instead and let a daemon thread do the (lock-taking)
+        # observe outside of gc context.
+        gc_pause_samples = deque(maxlen=100000)
+
+        def _gc_pause_flush_loop():
+            while True:
+                time.sleep(1.0)
+                while True:
+                    try:
+                        sample_gen, sample_duration = gc_pause_samples.popleft()
+                    except IndexError:
+                        break
+                    gc_pause_histogram.labels(generation=sample_gen).observe(
+                        sample_duration
+                    )
+
+        threading.Thread(
+            target=_gc_pause_flush_loop, name="gc-pause-flush", daemon=True
+        ).start()
     else:
         gc_pause_histogram = None
+        gc_pause_samples = None
 
     gc_start_time = {}
 
@@ -3700,8 +3729,9 @@ def configure_gc_warning(warn_threshold_secs: float = 0.0, enable_metrics: bool 
             gc_start_time[gen] = time.time()
         elif phase == "stop":
             duration = time.time() - gc_start_time.get(gen, time.time())
-            if gc_pause_histogram is not None:
-                gc_pause_histogram.labels(generation=str(gen)).observe(duration)
+            if gc_pause_samples is not None:
+                # lock-free; the (lock-taking) observe happens off-thread. See above.
+                gc_pause_samples.append((str(gen), duration))
             if warn_threshold_secs > 0.0 and duration > warn_threshold_secs:
                 g0, g1, g2 = gc_object_counts()
                 logger.warn(
