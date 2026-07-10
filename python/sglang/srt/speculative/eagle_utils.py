@@ -496,6 +496,19 @@ def eagle_prepare_for_verify(
             batch, verify_input.draft_token_num
         )
 
+        tracker = batch.token_to_kv_pool_allocator.tracker
+        if tracker.enabled:
+            from sglang.srt.mem_cache.kv_integrity import record_alloc_per_req
+
+            num_reqs = len(batch.req_pool_indices)
+            lens_per_req = [verify_input.draft_token_num] * num_reqs
+            record_alloc_per_req(
+                tracker,
+                batch.req_pool_indices,
+                lens_per_req,
+                batch.out_cache_loc,
+            )
+
         prepare_mamba_track_for_verify(batch)
 
         # TBO's split_spec_info reads these; no-verify-sync leaves both None.
@@ -840,6 +853,19 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
             req_pool_indices=batch.req_pool_indices,
             batch=batch,
         )
+
+    tracker = batch.token_to_kv_pool_allocator.tracker
+    if tracker.enabled:
+        from sglang.srt.mem_cache.kv_integrity import record_alloc_per_req
+
+        lens_per_req = (nxt_kv_lens_cpu - cur_kv_lens_cpu).tolist()
+        record_alloc_per_req(
+            tracker,
+            batch.req_pool_indices,
+            lens_per_req,
+            out_cache_loc,
+        )
+
     assign_req_to_token_pool_func(
         batch.req_pool_indices,
         batch.req_to_token_pool.req_to_token,

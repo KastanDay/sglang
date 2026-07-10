@@ -47,6 +47,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.is_not_in_free_group = True
         self.free_group = []
 
+        from sglang.srt.mem_cache.kv_integrity import _NullTracker
+
+        self.tracker = _NullTracker()
+
     @property
     def size_full(self):
         return self.size

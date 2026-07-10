@@ -331,6 +331,19 @@ class NGRAMWorker(BaseSpecWorker):
             device=self.device,
         )
 
+        tracker = batch.token_to_kv_pool_allocator.tracker
+        if tracker.enabled:
+            from sglang.srt.mem_cache.kv_integrity import record_alloc_per_req
+
+            num_reqs = len(batch.req_pool_indices)
+            lens_per_req = [self.draft_token_num] * num_reqs
+            record_alloc_per_req(
+                tracker,
+                batch.req_pool_indices,
+                lens_per_req,
+                batch.out_cache_loc,
+            )
+
         prepare_mamba_track_for_verify(batch)
 
         batch.spec_info = NgramVerifyInput(
