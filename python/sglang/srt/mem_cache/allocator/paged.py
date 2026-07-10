@@ -261,6 +261,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        self.tracker.on_free(free_index)
 
         if self.is_not_in_free_group:
             free_page_indices = torch.unique(free_index // self.page_size)

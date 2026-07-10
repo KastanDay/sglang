@@ -663,6 +663,35 @@ class ReqLogprob:
     output_token_ids_logprobs_idx: Optional[list] = None
 
 
+def _record_extend_for_tracker(tracker, batch, out_cache_loc) -> None:
+    if not getattr(tracker, "enabled", False):
+        return
+    from sglang.srt.mem_cache.kv_integrity import record_alloc_per_req
+
+    for req in batch.reqs:
+        prefix = req.prefix_indices
+        if prefix is not None and len(prefix) > 0:
+            tracker.on_prefix_hit(req.req_pool_idx, prefix)
+    prefix_lens = batch.prefix_lens_cpu.tolist()
+    seq_lens = batch.seq_lens_cpu.tolist()
+    lens_per_req = [seq_lens[i] - prefix_lens[i] for i in range(len(batch.reqs))]
+    req_pool_indices = [req.req_pool_idx for req in batch.reqs]
+    record_alloc_per_req(tracker, req_pool_indices, lens_per_req, out_cache_loc)
+
+
+def _record_decode_for_tracker(tracker, batch, out_cache_loc) -> None:
+    if not getattr(tracker, "enabled", False):
+        return
+    from sglang.srt.mem_cache.kv_integrity import record_alloc_per_req
+
+    record_alloc_per_req(
+        tracker,
+        req_pool_indices=[req.req_pool_idx for req in batch.reqs],
+        lens_per_req=[1] * len(batch.reqs),
+        out_cache_loc=out_cache_loc,
+    )
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -2278,6 +2307,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
+        # KV integrity tracking: record extend allocations + prefix hits, then
+        # validate the batch and abort offending requests.
+        tracker = self.token_to_kv_pool_allocator.tracker
+        if tracker.enabled:
+            self.prefix_lens_cpu = torch.tensor(prefix_lens, dtype=torch.int64)
+            _record_extend_for_tracker(tracker, self, self.out_cache_loc)
+            violations = tracker.validate_batch(self)
+            for v in violations:
+                logger.warning(
+                    "Aborting rid=%s due to KV integrity violation on pages %s",
+                    v.req.rid,
+                    v.bad_pages,
+                )
+                v.req.to_finish = FINISH_ABORT(
+                    f"KV integrity violation on pages {v.bad_pages}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "KVIntegrityError",
+                )
+
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,
         req: Req,
@@ -2625,6 +2673,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
 
+        # KV integrity validation must run BEFORE the spec-decode early-return
+        # below -- otherwise spec-decode workloads (where every decode step
+        # short-circuits via that return) never validate.
+        tracker = self.token_to_kv_pool_allocator.tracker
+        if tracker.enabled:
+            violations = tracker.validate_batch(self)
+            for v in violations:
+                logger.warning(
+                    "Aborting rid=%s due to KV integrity violation on pages %s",
+                    v.req.rid,
+                    v.bad_pages,
+                )
+                v.req.to_finish = FINISH_ABORT(
+                    f"KV integrity violation on pages {v.bad_pages}",
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "KVIntegrityError",
+                )
+
         if not self.spec_algorithm.is_none():
             # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).
             from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
@@ -2691,6 +2757,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 .pin_memory()
                 .to(device=self.device, non_blocking=True)
             )
+
+        # KV integrity tracking: record this step's decode allocations.
+        # Validation runs at the TOP of the next prepare_for_decode (before
+        # any spec-decode early-return) so spec and non-spec paths both get
+        # checked exactly once per step.
+        tracker = self.token_to_kv_pool_allocator.tracker
+        if tracker.enabled:
+            _record_decode_for_tracker(tracker, self, self.out_cache_loc)
 
     def filter_batch(
         self,
