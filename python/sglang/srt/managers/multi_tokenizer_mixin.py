@@ -351,9 +351,24 @@ class MultiHttpWorkerDetokenizerMixin:
     def multi_http_worker_event_loop(self: DetokenizerManager):
         """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
+        import time
         while True:
             recv_obj = sock_recv(self.recv_from_scheduler)
+            t0 = time.perf_counter()
             output = self._request_dispatcher(recv_obj)
+            # CF pipeline-liveness metrics: record one observation per
+            # detokenizer batch, regardless of whether the upstream
+            # MultiDetokenizerRouter forwarded a BaseBatchReq (fan-out) or a
+            # BaseReq (single). Recording here keeps the "one observation per
+            # detokenizer dispatch" semantics for both shapes.
+            if getattr(self, "_batches_total", None) is not None:
+                self._batches_total.inc()
+                if hasattr(recv_obj, "rids"):
+                    self._batch_size.observe(len(recv_obj.rids))
+                else:
+                    self._batch_size.observe(1)
+                self._decode_seconds.observe(time.perf_counter() - t0)
+
             if output is None:
                 continue
 

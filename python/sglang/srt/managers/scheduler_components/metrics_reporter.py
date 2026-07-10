@@ -147,6 +147,12 @@ class SchedulerMetricsReporter:
         self.enable_mfu_metrics = False
 
         if self.enable_metrics:
+            if self.scheduler.ps.attn_tp_rank == 0:
+                from sglang.srt.observability.cpu_monitor import (
+                    start_cpu_monitor_thread,
+                )
+
+                start_cpu_monitor_thread("scheduler")
             self.enable_mfu_metrics = self.scheduler.server_args.enable_mfu_metrics
             if self.enable_mfu_metrics:
                 self._init_estimated_perf_constants()
