@@ -1497,9 +1497,16 @@ class HiRadixCache(RadixCache):
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
-        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
+        min_completed_tokens = (
+            operation.pool_storage_result.clamp_to_all_pages_coverage(
+                completed_tokens, self.page_size, operation.pool_transfers
+            )
+        )
+        logger.debug(
+            f"Prefetch {req_id} completed with {completed_tokens} tokens, "
+            f"publishing {min_completed_tokens} tokens"
+        )
 
-        min_completed_tokens = completed_tokens
         # Synchronize workers before mutating host cache tree state.
         completed_tokens_tensor = torch.tensor(min_completed_tokens, dtype=torch.int)
         self._all_reduce_attn_groups(
