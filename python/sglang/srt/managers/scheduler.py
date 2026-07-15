@@ -61,6 +61,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    defer_chunked_prefill_abort,
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
@@ -2557,21 +2558,18 @@ class Scheduler(
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            req.disagg_kv_sender.abort()
-            maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
-            )
-            req.pending_bootstrap = False
-        if self.enable_hicache_storage:
-            self.tree_cache.release_aborted_request(req.rid)
-        if (
-            req.req_pool_idx is not None or self.tree_cache.supports_mamba()
-        ) and not req.kv_committed_freed:
-            release_kv_cache(req, self.tree_cache, is_insert=False)
+            defer_chunked_prefill_abort(req, self.disagg_prefill_inflight_queue)
+        else:
+            if self.enable_hicache_storage:
+                self.tree_cache.release_aborted_request(req.rid)
+            if (
+                req.req_pool_idx is not None or self.tree_cache.supports_mamba()
+            ) and not req.kv_committed_freed:
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):

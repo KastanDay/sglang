@@ -782,7 +782,16 @@ class SchedulerDisaggregationPrefillMixin:
                 else:
                     logger.warning(error_message)
                 req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
+                if isinstance(req.finished_reason, FINISH_ABORT):
+                    if self.enable_hicache_storage:
+                        self.tree_cache.release_aborted_request(req.rid)
+                    if (
+                        req.req_pool_idx is not None or self.tree_cache.supports_mamba()
+                    ) and not req.kv_committed_freed:
+                        release_kv_cache(req, self.tree_cache, is_insert=False)
+                    req.pending_bootstrap = False
+                else:
+                    release_kv_cache(req, self.tree_cache)  # unlock the tree
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     prepare_abort(
                         req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
