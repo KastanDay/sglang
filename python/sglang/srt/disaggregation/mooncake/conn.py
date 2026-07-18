@@ -7,7 +7,7 @@ import os
 import struct
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
@@ -63,6 +63,10 @@ logger = logging.getLogger(__name__)
 QUIESCE_CAPABILITY = "QUIESCE_V1"
 QUIESCE_CAPABILITY_BYTES = QUIESCE_CAPABILITY.encode("ascii")
 ABORT_RETRY_INTERVAL_S = 0.5
+MAX_PENDING_BOOTSTRAP_ROOMS = 1024
+MAX_PENDING_BOOTSTRAP_BYTES = 64 * 1024 * 1024
+MAX_BOOTSTRAP_METADATA_DESTINATIONS = 4096
+MAX_RETIRED_BOOTSTRAP_ROOMS = 4096
 
 FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
@@ -194,6 +198,15 @@ class TransferInfo:
         )
 
 
+@dataclasses.dataclass
+class PendingBootstrapMetadata:
+    first_seen: float
+    required_dst_info_num: int
+    infos: dict[str, TransferInfo] = dataclasses.field(default_factory=dict)
+    fingerprints: dict[str, tuple[bytes, ...]] = dataclasses.field(default_factory=dict)
+    retained_bytes: int = 0
+
+
 # decode
 @dataclasses.dataclass
 class KVArgsRegisterInfo:
@@ -255,6 +268,16 @@ class MooncakeKVManager(CommonKVManager):
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.enable_trace = server_args.enable_trace
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self._bootstrap_rendezvous_lock = threading.RLock()
+            self._pending_bootstrap_metadata: dict[int, PendingBootstrapMetadata] = {}
+            self._pending_bootstrap_bytes = 0
+            self._bootstrap_metadata_fingerprints: dict[
+                int, dict[str, tuple[bytes, ...]]
+            ] = {}
+            self._retired_bootstrap_rooms: OrderedDict[int, tuple[float, str]] = (
+                OrderedDict()
+            )
+            self._bootstrap_rendezvous_ttl = max(0.0, float(self.bootstrap_timeout))
             self.room_lifetimes = {}
             self.room_abort_tokens = defaultdict(set)
             self.room_lifetimes_lock = threading.Lock()
@@ -356,15 +379,242 @@ class MooncakeKVManager(CommonKVManager):
         with self.room_lifetimes_lock:
             if token not in self.room_abort_tokens.get(room, ()):
                 return None
-            lifetime = self.room_lifetimes.get(room)
-        if lifetime is not None:
-            lifetime.abort()
+            lifetime = self.room_lifetimes.setdefault(room, RoomTransferLifetime())
+        self._retire_bootstrap_room(room, "decode aborted bootstrap")
+        lifetime.abort()
         return lifetime
 
     def _clear_room_lifetime(self, room: int) -> None:
         with self.room_lifetimes_lock:
             self.room_lifetimes.pop(room, None)
             self.room_abort_tokens.pop(room, None)
+
+    def _expire_bootstrap_rendezvous_locked(self, now: float) -> None:
+        ttl = self._bootstrap_rendezvous_ttl
+        for room, pending in list(self._pending_bootstrap_metadata.items()):
+            if now - pending.first_seen >= ttl:
+                self._retire_bootstrap_room_locked(
+                    room,
+                    now,
+                    f"early Mooncake metadata expired after {ttl:.1f}s",
+                    clear_active=True,
+                )
+                logger.error(
+                    "Retired room %s after early Mooncake metadata expired", room
+                )
+
+        while self._retired_bootstrap_rooms:
+            room, (retired_at, _reason) = next(
+                iter(self._retired_bootstrap_rooms.items())
+            )
+            if now - retired_at < ttl:
+                break
+            self._retired_bootstrap_rooms.pop(room)
+
+    def _retire_bootstrap_room_locked(
+        self,
+        room: int,
+        now: float,
+        reason: str,
+        *,
+        clear_active: bool,
+    ) -> None:
+        pending = self._pending_bootstrap_metadata.pop(room, None)
+        if pending is not None:
+            self._pending_bootstrap_bytes -= pending.retained_bytes
+        if clear_active:
+            self.transfer_infos.pop(room, None)
+            self._bootstrap_metadata_fingerprints.pop(room, None)
+            self.req_to_decode_prefix_len.pop(room, None)
+        self._retired_bootstrap_rooms.pop(room, None)
+        self._retired_bootstrap_rooms[room] = (now, reason)
+        while len(self._retired_bootstrap_rooms) > MAX_RETIRED_BOOTSTRAP_ROOMS:
+            self._retired_bootstrap_rooms.popitem(last=False)
+
+    def _retire_bootstrap_room(
+        self, room: int, reason: str, *, clear_active: bool = False
+    ) -> None:
+        with self._bootstrap_rendezvous_lock:
+            now = time.monotonic()
+            self._expire_bootstrap_rendezvous_locked(now)
+            self._retire_bootstrap_room_locked(
+                room, now, reason, clear_active=clear_active
+            )
+
+    def _clear_bootstrap_room(self, room: int) -> None:
+        with self._bootstrap_rendezvous_lock:
+            now = time.monotonic()
+            self._expire_bootstrap_rendezvous_locked(now)
+            self._retire_bootstrap_room_locked(
+                room, now, "bootstrap room cleared", clear_active=True
+            )
+            self.request_status.pop(room, None)
+
+    def _complete_bootstrap_metadata_locked(self, room: int) -> None:
+        infos = self.transfer_infos[room]
+        required = next(iter(infos.values())).required_dst_info_num
+        if len(infos) != required:
+            return
+        self.resolve_kv_replica_factor(infos)
+        self.req_to_decode_prefix_len[room] = next(
+            (
+                info.decode_prefix_len
+                for info in infos.values()
+                if info.decode_prefix_len is not None
+            ),
+            0,
+        )
+        self.update_status(room, KVPoll.WaitingForInput)
+
+    def _fail_bootstrap_metadata_locked(
+        self, room: int, now: float, reason: str
+    ) -> bool:
+        self._retire_bootstrap_room_locked(room, now, reason, clear_active=True)
+        if room in self.request_status and self.request_status[room] != KVPoll.Success:
+            self.update_status(room, KVPoll.Failed)
+            return True
+        return False
+
+    def _reject_bootstrap_metadata(self, room: int, reason: str) -> None:
+        with self._bootstrap_rendezvous_lock:
+            now = time.monotonic()
+            self._expire_bootstrap_rendezvous_locked(now)
+            should_record = self._fail_bootstrap_metadata_locked(room, now, reason)
+        if should_record:
+            self.record_failure(room, reason)
+        logger.error("Rejected metadata for room %s: %s", room, reason)
+
+    def _register_bootstrap_metadata(self, msg: List[bytes]) -> None:
+        fingerprint = tuple(msg)
+        retained_bytes = sum(len(part) for part in msg)
+        room = None
+        try:
+            room = int(msg[0].decode("ascii"))
+            session_id = msg[3].decode("ascii")
+            transfer_info = TransferInfo.from_zmq(msg)
+        except (TypeError, ValueError, IndexError, struct.error) as error:
+            reason = f"invalid Mooncake bootstrap metadata: {error}"
+            should_record = False
+            if room is not None:
+                with self._bootstrap_rendezvous_lock:
+                    now = time.monotonic()
+                    should_record = self._fail_bootstrap_metadata_locked(
+                        room, now, reason
+                    )
+                if should_record:
+                    self.record_failure(room, reason)
+            logger.error("Rejected metadata for room %s: %s", room, reason)
+            return
+
+        required = transfer_info.required_dst_info_num
+        reason = None
+        should_record = False
+        with self._bootstrap_rendezvous_lock:
+            now = time.monotonic()
+            self._expire_bootstrap_rendezvous_locked(now)
+            if room in self._retired_bootstrap_rooms:
+                logger.debug("Dropping metadata for retired room %s", room)
+                return
+            status = self.request_status.get(room)
+            if status in (KVPoll.Failed, KVPoll.Success):
+                self._retire_bootstrap_room_locked(
+                    room,
+                    now,
+                    "metadata arrived after terminal status",
+                    clear_active=status == KVPoll.Failed,
+                )
+                return
+            if required <= 0 or required > MAX_BOOTSTRAP_METADATA_DESTINATIONS:
+                reason = f"invalid Mooncake destination count {required}"
+            elif status is None:
+                pending = self._pending_bootstrap_metadata.get(room)
+                if pending is None:
+                    if (
+                        len(self._pending_bootstrap_metadata)
+                        >= MAX_PENDING_BOOTSTRAP_ROOMS
+                        or self._pending_bootstrap_bytes + retained_bytes
+                        > MAX_PENDING_BOOTSTRAP_BYTES
+                    ):
+                        reason = "early Mooncake metadata rendezvous capacity exceeded"
+                    else:
+                        pending = PendingBootstrapMetadata(now, required)
+                        self._pending_bootstrap_metadata[room] = pending
+                if pending is not None and reason is None:
+                    if pending.required_dst_info_num != required:
+                        reason = (
+                            "conflicting Mooncake destination counts "
+                            f"{pending.required_dst_info_num} and {required}"
+                        )
+                    elif session_id in pending.infos:
+                        if pending.fingerprints[session_id] == fingerprint:
+                            return
+                        reason = f"conflicting Mooncake metadata for {session_id}"
+                    elif len(pending.infos) >= required:
+                        reason = "Mooncake metadata exceeded destination count"
+                    elif (
+                        self._pending_bootstrap_bytes + retained_bytes
+                        > MAX_PENDING_BOOTSTRAP_BYTES
+                    ):
+                        reason = "early Mooncake metadata byte capacity exceeded"
+                    else:
+                        pending.infos[session_id] = transfer_info
+                        pending.fingerprints[session_id] = fingerprint
+                        pending.retained_bytes += retained_bytes
+                        self._pending_bootstrap_bytes += retained_bytes
+            else:
+                infos = self.transfer_infos.setdefault(room, {})
+                fingerprints = self._bootstrap_metadata_fingerprints.setdefault(
+                    room, {}
+                )
+                if infos:
+                    active_required = next(iter(infos.values())).required_dst_info_num
+                    if active_required != required:
+                        reason = (
+                            "conflicting Mooncake destination counts "
+                            f"{active_required} and {required}"
+                        )
+                if reason is None and session_id in infos:
+                    if fingerprints[session_id] == fingerprint:
+                        return
+                    reason = f"conflicting Mooncake metadata for {session_id}"
+                elif reason is None and len(infos) >= required:
+                    reason = "Mooncake metadata exceeded destination count"
+                elif reason is None:
+                    infos[session_id] = transfer_info
+                    fingerprints[session_id] = fingerprint
+                    self._complete_bootstrap_metadata_locked(room)
+
+            if reason is not None:
+                should_record = self._fail_bootstrap_metadata_locked(room, now, reason)
+
+        if reason is not None:
+            if should_record:
+                self.record_failure(room, reason)
+            logger.error("Rejected metadata for room %s: %s", room, reason)
+            return
+        self._register_room_abort_token(room, transfer_info.abort_token)
+
+    def _associate_bootstrap_room(self, room: int) -> None:
+        reason = None
+        with self._bootstrap_rendezvous_lock:
+            now = time.monotonic()
+            self._expire_bootstrap_rendezvous_locked(now)
+            retired = self._retired_bootstrap_rooms.get(room)
+            if retired is not None:
+                reason = retired[1]
+                self.update_status(room, KVPoll.Failed)
+            elif self.request_status.get(room) == KVPoll.Failed:
+                reason = "Mooncake bootstrap association already failed"
+                self._retire_bootstrap_room_locked(room, now, reason, clear_active=True)
+            else:
+                pending = self._pending_bootstrap_metadata.pop(room, None)
+                if pending is not None:
+                    self._pending_bootstrap_bytes -= pending.retained_bytes
+                    self.transfer_infos[room] = pending.infos
+                    self._bootstrap_metadata_fingerprints[room] = pending.fingerprints
+                    self._complete_bootstrap_metadata_locked(room)
+        if reason is not None:
+            self.record_failure(room, reason)
 
     def _get_endpoint_send_lock(self, endpoint: str) -> threading.Lock:
         with self._endpoint_send_locks_lock:
@@ -1774,47 +2024,14 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     continue
                 else:
-                    required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
-                    room = int(room)
                     if not _has_transfer_metadata_capability(waiting_req_bytes):
-                        self.record_failure(
+                        room = int(room)
+                        self._reject_bootstrap_metadata(
                             room,
                             f"Mooncake decode metadata is missing {QUIESCE_CAPABILITY}",
                         )
-                        self.update_status(room, KVPoll.Failed)
                         continue
-                    if (
-                        room not in self.request_status
-                        or self.check_status(room) == KVPoll.Success
-                    ):
-                        logger.debug(
-                            "Dropping metadata for unknown/completed room %s", room
-                        )
-                        continue
-                    lifetime = self._get_room_lifetime(room)
-                    if not lifetime.acquire():
-                        logger.debug("Dropping bootstrap for aborted room %s", room)
-                        continue
-                    try:
-                        if room not in self.transfer_infos:
-                            self.transfer_infos[room] = {}
-
-                        transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
-                        self._register_room_abort_token(room, transfer_info.abort_token)
-                        self.transfer_infos[room][mooncake_session_id] = transfer_info
-                        if len(self.transfer_infos[room]) == required_dst_info_num:
-                            self.resolve_kv_replica_factor(self.transfer_infos[room])
-                            self.req_to_decode_prefix_len[room] = next(
-                                (
-                                    info.decode_prefix_len
-                                    for info in self.transfer_infos[room].values()
-                                    if info.decode_prefix_len is not None
-                                ),
-                                0,
-                            )
-                            self.update_status(room, KVPoll.WaitingForInput)
-                    finally:
-                        lifetime.release()
+                    self._register_bootstrap_metadata(waiting_req_bytes)
 
         threading.Thread(target=bootstrap_thread).start()
 
@@ -2021,6 +2238,7 @@ class MooncakeKVSender(CommonKVSender):
             pp_rank,
             req_has_disagg_prefill_dp_rank,
         )
+        self.kv_mgr._associate_bootstrap_room(self.bootstrap_room)
         self.conclude_state = None
         self._failure_quiescence_started = False
         self.init_time = time.time()
@@ -2068,6 +2286,9 @@ class MooncakeKVSender(CommonKVSender):
                 self.conclude_state = status
                 self.trace_ctx.trace_req_finish()
             elif status == KVPoll.Success:
+                self.kv_mgr._retire_bootstrap_room(
+                    self.bootstrap_room, "Mooncake bootstrap completed"
+                )
                 lifetime = self.kv_mgr._abort_room(self.bootstrap_room)
                 if lifetime is not None and not lifetime.is_quiesced():
                     return KVPoll.Transferring
@@ -2091,6 +2312,9 @@ class MooncakeKVSender(CommonKVSender):
         if self._failure_quiescence_started:
             return
         self._failure_quiescence_started = True
+        self.kv_mgr._retire_bootstrap_room(
+            self.bootstrap_room, "Mooncake bootstrap failed or aborted"
+        )
         self.kv_mgr._abort_room(self.bootstrap_room)
         super().abort()
 
@@ -2102,7 +2326,7 @@ class MooncakeKVSender(CommonKVSender):
         return self._failure_quiescence_started
 
     def clear(self) -> None:
-        super().clear()
+        self.kv_mgr._clear_bootstrap_room(self.bootstrap_room)
         self.kv_mgr._clear_room_lifetime(self.bootstrap_room)
 
     def failure_exception(self):
