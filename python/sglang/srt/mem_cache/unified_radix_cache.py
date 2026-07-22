@@ -2161,7 +2161,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
-        if rid not in self.ongoing_prefetch:
+        info = self.ongoing_prefetch.get(rid)
+        local_state = (
+            0
+            if info is None
+            else 1
+            if info.operation.host_indices is None
+            else 2
+        )
+        abort_state = torch.tensor(local_state, dtype=torch.int)
+        self._all_reduce_attn_groups(abort_state, torch.distributed.ReduceOp.MAX)
+        global_state = int(abort_state.item())
+
+        if global_state == 0:
+            return
+
+        # Every rank must participate in the transfer barrier when any rank has
+        # started storage I/O. A rank can legitimately still see the request as
+        # pending (or already revoked) while a peer has allocated host pages.
+        if info is None:
+            if global_state == 2:
+                self._barrier_attn_groups()
             return
 
         (
@@ -2171,10 +2191,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             operation,
             anchor_lock_params,
             comp_xfers,
-        ) = self.ongoing_prefetch[rid]
+        ) = info
         if operation.host_indices is None:
             self.cache_controller.terminate_prefetch(operation)
             self._revoke_pending_prefetch(rid)
+            if global_state == 2:
+                self._barrier_attn_groups()
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
