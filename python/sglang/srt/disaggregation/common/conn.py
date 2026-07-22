@@ -226,7 +226,10 @@ class CommonKVManager(BaseKVManager):
                 return
             self.request_status[bootstrap_room] = status
         else:
-            if status == KVPoll.Failed:
+            if (
+                self.request_status[bootstrap_room] == KVPoll.Failed
+                or status == KVPoll.Failed
+            ):
                 self.request_status[bootstrap_room] = KVPoll.Failed
             else:
                 self.request_status[bootstrap_room] = max(
