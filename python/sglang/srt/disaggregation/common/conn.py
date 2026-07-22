@@ -257,7 +257,13 @@ class CommonKVManager(BaseKVManager):
                 return
             self.request_status[bootstrap_room] = status
         else:
-            if status == KVPoll.Failed:
+            # Failure is terminal for the current room generation. A late
+            # transfer completion must not promote a failed request back to
+            # Transferring or Success before the sender calls clear().
+            if (
+                self.request_status[bootstrap_room] == KVPoll.Failed
+                or status == KVPoll.Failed
+            ):
                 self.request_status[bootstrap_room] = KVPoll.Failed
             else:
                 self.request_status[bootstrap_room] = max(
