@@ -1837,6 +1837,19 @@ class SchedulerDisaggregationDecodeMixin:
 
             self._apply_war_barrier()
 
+            # Grammar sync: commit the previous result BEFORE scheduling the
+            # next batch.  get_next_disagg_decode_batch_to_run calls
+            # process_prebuilt which runs accept_token on newly-arriving
+            # requests; their grammar must see the fully-committed state.
+            need_grammar_sync = (
+                self.last_batch
+                and not self.last_batch.spec_algorithm.is_none()
+                and self.last_batch.has_grammar
+                and len(self.result_queue) > 0
+            )
+            if need_grammar_sync:
+                pop_and_process()
+
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
@@ -1855,7 +1868,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not disable_overlap_for_batch and not need_grammar_sync:
                     pop_and_process()
             elif batch is None:
                 self.on_idle()
