@@ -2017,19 +2017,34 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             operation
         )
         min_completed_tokens = completed_tokens
+        sidecar_transfers = [
+            transfer for transfers in comp_xfers.values() for transfer in transfers
+        ]
+        sidecar_pools = [transfer.name for transfer in sidecar_transfers]
         hit_pages = operation.pool_storage_result.extra_pool_hit_pages
+        leading_hit_pages = (
+            operation.pool_storage_result.extra_pool_leading_hit_pages
+        )
         if self.tp_world_size > 1:
-            # Reduce full completed tokens together with the sidecar pools that
-            # this prefetch actually transferred, in one all_reduce.
-            sidecar_pools = [t.name for xfers in comp_xfers.values() for t in xfers]
             packed = torch.tensor(
-                [completed_tokens] + [hit_pages.get(p, 0) for p in sidecar_pools],
+                [completed_tokens]
+                + [hit_pages.get(pool, 0) for pool in sidecar_pools]
+                + [leading_hit_pages.get(pool, 0) for pool in sidecar_pools],
                 dtype=torch.int,
             )
             self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
             min_completed_tokens = int(packed[0].item())
-            for i, p in enumerate(sidecar_pools, start=1):
-                hit_pages[p] = int(packed[i].item())
+            for index, pool in enumerate(sidecar_pools, start=1):
+                hit_pages[pool] = int(packed[index].item())
+                leading_hit_pages[pool] = int(
+                    packed[index + len(sidecar_pools)].item()
+                )
+
+        min_completed_tokens = (
+            operation.pool_storage_result.clamp_to_all_pages_coverage(
+                min_completed_tokens, self.page_size, sidecar_transfers
+            )
+        )
 
         fetched_key = prefetch_key[:min_completed_tokens]
         insert_result = self._insert_helper_host(
@@ -2087,29 +2102,55 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
-        if rid not in self.ongoing_prefetch:
-            return
-
-        (
-            last_host_node,
-            prefetch_key,
-            host_indices,
-            operation,
-            anchor_lock_params,
-            comp_xfers,
-        ) = self.ongoing_prefetch[rid]
-        if operation.host_indices is None:
-            return
-
-        completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
-        self._barrier_attn_groups()
-        self.dec_host_lock_ref(last_host_node, anchor_lock_params)
-        del self.ongoing_prefetch[rid]
-        self.cache_controller.append_host_mem_release(
-            host_indices=host_indices[:completed_tokens],
-            extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
+        info = self.ongoing_prefetch.get(rid)
+        if info is not None:
+            (
+                anchor_node,
+                prefetch_key,
+                host_indices,
+                operation,
+                anchor_lock_params,
+                comp_xfers,
+            ) = info
+        else:
+            operation = None
+        has_active_operation = torch.tensor(
+            int(operation is not None and operation.host_indices is not None),
+            dtype=torch.int,
         )
-        self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+        self._all_reduce_attn_groups(
+            has_active_operation, torch.distributed.ReduceOp.MAX
+        )
+        any_active_operation = bool(has_active_operation.item())
+        if info is None and not any_active_operation:
+            return
+
+        completed_tokens = 0
+        if operation is not None and operation.host_indices is not None:
+            completed_tokens, _ = self.cache_controller.terminate_prefetch(
+                operation
+            )
+        if any_active_operation:
+            self._barrier_attn_groups()
+        if info is None:
+            return
+
+        self.dec_host_lock_ref(anchor_node, anchor_lock_params)
+        del self.ongoing_prefetch[rid]
+        release_args = {
+            "extra_pools": [
+                transfer
+                for transfers in comp_xfers.values()
+                for transfer in transfers
+            ]
+        }
+        if operation.host_indices is not None:
+            release_args["host_indices"] = host_indices[:completed_tokens]
+        self.cache_controller.append_host_mem_release(**release_args)
+        self.cache_controller.prefetch_tokens_occupied = max(
+            0,
+            self.cache_controller.prefetch_tokens_occupied - len(prefetch_key),
+        )
 
     def _drain_storage_control_queues_impl(
         self,
