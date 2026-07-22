@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import math
 from typing import TYPE_CHECKING
 
@@ -1191,6 +1192,44 @@ class ModelRunnerKVCacheMixin:
                 "(fa3/fa4) prefill backend, --is-embedding, --chunked-prefill-size=-1, "
                 "--disable-radix-cache, no context-parallel attention, no HiSparse, "
                 "and --kv-cache-dtype != fp4_e2m1."
+            )
+
+        from sglang.srt.mem_cache.kv_integrity import (
+            _NullTracker,
+            make_tracker,
+            should_warn_unsupported_spec_decode_shape,
+        )
+
+        if isinstance(self.token_to_kv_pool_allocator, PagedTokenToKVPoolAllocator):
+            tracker = make_tracker(
+                num_pages=self.token_to_kv_pool_allocator.num_pages,
+                page_size=self.token_to_kv_pool_allocator.page_size,
+                req_pool_size=self.req_to_token_pool.size,
+            )
+        else:
+            tracker = _NullTracker()
+            if os.environ.get("SGLANG_KV_INTEGRITY", "off").lower() == "host":
+                logger.warning(
+                    "SGLANG_KV_INTEGRITY=host is only supported for paged "
+                    "allocators (PagedTokenToKVPoolAllocator). Got %s — falling "
+                    "back to no-op tracker.",
+                    type(self.token_to_kv_pool_allocator).__name__,
+                )
+        self.token_to_kv_pool_allocator.tracker = tracker
+        self.req_to_token_pool.tracker = tracker
+
+        if should_warn_unsupported_spec_decode_shape(
+            tracker.enabled,
+            getattr(self.server_args, "speculative_eagle_topk", None),
+            self.token_to_kv_pool_allocator.page_size,
+        ):
+            logger.warning(
+                "SGLANG_KV_INTEGRITY=host: speculative_eagle_topk > 1 with "
+                "page_size > 1 is not fully covered (the topk>1 tree-draft "
+                "post-alloc cache_loc duplication shape in eagle_worker_v2.py "
+                "is omitted). Spec-decode allocation bugs in this exact "
+                "configuration may not be caught. Set speculative_eagle_topk=1 "
+                "(Spec v2 default) for full coverage."
             )
 
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:

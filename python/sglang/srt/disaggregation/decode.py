@@ -1453,6 +1453,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             f"req={req.rid}"
         )
 
+        tracker = self.token_to_kv_pool_allocator.tracker
+        if tracker.enabled:
+            tracker.on_alloc(req.req_pool_idx, kv_loc)
+
         self.req_to_token_pool.write(
             (
                 req.req_pool_idx,
