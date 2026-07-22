@@ -1,7 +1,7 @@
 import concurrent.futures
 import threading
 import unittest
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -572,6 +572,95 @@ class TestMooncakeCapabilities(unittest.TestCase):
             QUIESCE_CAPABILITY_BYTES,
         ]
         self.assertEqual(TransferInfo.from_zmq(metadata).room, 7)
+
+
+class TestBootstrapMetadataRendezvous(unittest.TestCase):
+    @staticmethod
+    def _metadata(room=7, session=b"session", token=b"token"):
+        return [
+            str(room).encode("ascii"),
+            b"127.0.0.1",
+            b"1",
+            session,
+            b"",
+            b"",
+            b"",
+            b"1",
+            b"0",
+            QUIESCE_CAPABILITY_BYTES,
+            token,
+        ]
+
+    @staticmethod
+    def _manager():
+        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+        manager._bootstrap_rendezvous_lock = threading.RLock()
+        manager._pending_bootstrap_metadata = {}
+        manager._pending_bootstrap_bytes = 0
+        manager._bootstrap_metadata_fingerprints = {}
+        manager._retired_bootstrap_rooms = OrderedDict()
+        manager._bootstrap_rendezvous_ttl = 30.0
+        manager.transfer_infos = {}
+        manager.req_to_decode_prefix_len = {}
+        manager.request_status = {}
+        manager.room_lifetimes = {}
+        manager.room_abort_tokens = defaultdict(set)
+        manager.room_lifetimes_lock = threading.Lock()
+        manager.update_status = lambda room, status: manager.request_status.__setitem__(
+            room, status
+        )
+        manager.record_failure = Mock()
+        manager.resolve_kv_replica_factor = Mock()
+        return manager
+
+    def test_metadata_before_sender_association_is_rendezvoused(self):
+        manager = self._manager()
+
+        manager._register_bootstrap_metadata(self._metadata())
+        self.assertIn(7, manager._pending_bootstrap_metadata)
+        self.assertNotIn(7, manager.transfer_infos)
+
+        manager.update_status(7, KVPoll.Bootstrapping)
+        manager._associate_bootstrap_room(7)
+
+        self.assertNotIn(7, manager._pending_bootstrap_metadata)
+        self.assertIn("session", manager.transfer_infos[7])
+        self.assertEqual(manager.request_status[7], KVPoll.WaitingForInput)
+        manager.resolve_kv_replica_factor.assert_called_once_with(
+            manager.transfer_infos[7]
+        )
+
+    def test_abort_before_sender_association_retires_early_metadata(self):
+        manager = self._manager()
+        manager._register_bootstrap_metadata(self._metadata())
+
+        lifetime = manager._abort_room_for_token(7, b"token")
+        self.assertIsNotNone(lifetime)
+        self.assertFalse(lifetime.acquire())
+
+        manager.update_status(7, KVPoll.Bootstrapping)
+        manager._associate_bootstrap_room(7)
+
+        self.assertEqual(manager.request_status[7], KVPoll.Failed)
+        self.assertNotIn(7, manager.transfer_infos)
+        self.assertNotIn(7, manager._pending_bootstrap_metadata)
+        manager.record_failure.assert_called_once()
+
+    def test_early_metadata_room_bound_fails_closed(self):
+        manager = self._manager()
+
+        with patch(
+            "sglang.srt.disaggregation.mooncake.conn.MAX_PENDING_BOOTSTRAP_ROOMS",
+            1,
+        ):
+            manager._register_bootstrap_metadata(self._metadata(room=7))
+            manager._register_bootstrap_metadata(
+                self._metadata(room=8, session=b"session-2")
+            )
+
+        self.assertIn(7, manager._pending_bootstrap_metadata)
+        self.assertNotIn(8, manager._pending_bootstrap_metadata)
+        self.assertIn(8, manager._retired_bootstrap_rooms)
 
 
 class TestTransferWorkerQuiescence(unittest.TestCase):
