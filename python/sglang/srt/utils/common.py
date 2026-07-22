@@ -3667,8 +3667,30 @@ def gc_object_counts():
     return g0, g1, g2
 
 
-def configure_gc_warning(warn_threshold_secs):
+def configure_gc_warning(warn_threshold_secs: float = 0.0, enable_metrics: bool = False):
+    """Install a gc.callbacks hook for GC pause observability.
+
+    - When enable_metrics is True, every GC pause is recorded in
+      `sglang:gc_pause_duration_seconds` regardless of duration.
+    - When warn_threshold_secs > 0, a warning is logged for pauses
+      that exceed the threshold (existing behavior).
+    Either feature can be enabled independently.
+    """
+    if not enable_metrics and warn_threshold_secs <= 0.0:
+        return  # nothing to do; preserve old no-op behavior
+
     import gc
+
+    if enable_metrics:
+        from prometheus_client import Histogram
+        gc_pause_histogram = Histogram(
+            name="sglang:gc_pause_duration_seconds",
+            documentation="Duration of CPython gc.collect() pauses, by generation.",
+            labelnames=["generation"],
+            buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0),
+        )
+    else:
+        gc_pause_histogram = None
 
     gc_start_time = {}
 
@@ -3678,7 +3700,9 @@ def configure_gc_warning(warn_threshold_secs):
             gc_start_time[gen] = time.time()
         elif phase == "stop":
             duration = time.time() - gc_start_time.get(gen, time.time())
-            if duration > warn_threshold_secs:
+            if gc_pause_histogram is not None:
+                gc_pause_histogram.labels(generation=str(gen)).observe(duration)
+            if warn_threshold_secs > 0.0 and duration > warn_threshold_secs:
                 g0, g1, g2 = gc_object_counts()
                 logger.warn(
                     f"LONG GARBAGE COLLECTION DETECTED | Generation {gen} | Duration: {duration:.4f}s | # Objects: gen0={g0}, gen1={g1}, gen2={g2} | "
