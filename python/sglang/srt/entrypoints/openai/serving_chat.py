@@ -38,7 +38,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     FunctionResponse,
     LogProbs,
     MessageProcessingResult,
-    PromptTokensDetails,
     ResponseParserProtocol,
     SglExt,
     ToolCall,
@@ -339,15 +338,6 @@ class OpenAIServingChat(OpenAIServingBase):
         """Post-process reasoning and tool_calls before building response."""
         return reasoning_text, tool_calls
 
-    def _continuous_usage_cached_details(
-        self, content: Dict[str, Any]
-    ) -> Optional[PromptTokensDetails]:
-        if not self.tokenizer_manager.server_args.enable_cache_report:
-            return None
-        return UsageProcessor._details_if_cached(
-            content["meta_info"].get("cached_tokens", 0)
-        )
-
     async def _generate_stream_content(
         self,
         content: Dict[str, Any],
@@ -389,7 +379,6 @@ class OpenAIServingChat(OpenAIServingBase):
                         prompt_tokens=prompt_tokens.get(index, 0),
                         reasoning_tokens=reasoning_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
-                        cached_tokens=self._continuous_usage_cached_details(content),
                     ).model_dump()
 
                 yield build_sse_content(
@@ -435,7 +424,6 @@ class OpenAIServingChat(OpenAIServingBase):
                         prompt_tokens=prompt_tokens.get(index, 0),
                         reasoning_tokens=reasoning_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
-                        cached_tokens=self._continuous_usage_cached_details(content),
                     ).model_dump()
 
                 yield build_sse_content(
@@ -463,7 +451,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens.get(index, 0),
                     reasoning_tokens=reasoning_tokens.get(index, 0),
                     completion_tokens=completion_tokens.get(index, 0),
-                    cached_tokens=self._continuous_usage_cached_details(content),
                 ).model_dump()
 
             yield build_sse_content(
@@ -1923,7 +1910,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     reasoning_tokens=reasoning_tokens,
-                    cached_tokens=self._continuous_usage_cached_details(content),
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"
@@ -1976,7 +1962,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     reasoning_tokens=reasoning_tokens,
-                    cached_tokens=self._continuous_usage_cached_details(content),
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"
