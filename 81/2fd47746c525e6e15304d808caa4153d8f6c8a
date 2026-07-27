@@ -1,0 +1,21 @@
+python/sglang/srt/disaggregation/mooncake/conn.py
+  s_64bca307c42648::t_1b2d58baa368cb 1192-1226,1553-1555,1557-1560
+test/registered/unit/disaggregation/test_mooncake_state_transfer_status.py
+  s_64bca307c42648::t_f8f1271ebefec3 1-69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "812fd47746c525e6e15304d808caa4153d8f6c8a",
+  "prompts": {},
+  "sessions": {
+    "s_64bca307c42648": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_05b241b2fffegVdTD6hRJFcbeN",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Kastan Day <kastan@cloudflare.com>"
+    }
+  }
+}
