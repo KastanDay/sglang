@@ -171,6 +171,9 @@ class HiCacheRestoreGatedKVReceiver:
     def advance_failure_quiescence(self) -> bool:
         return self.decode_req.kv_receiver.advance_failure_quiescence()
 
+    def fail_closed_on_quiescence_error(self) -> bool:
+        return self.decode_req.kv_receiver.fail_closed_on_quiescence_error()
+
     def is_failure_quiescing(self) -> bool:
         return self.decode_req.kv_receiver.is_failure_quiescing()
 

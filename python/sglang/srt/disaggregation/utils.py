@@ -149,20 +149,23 @@ def _advance_quiescence(poller) -> int:
     """Ask one poller whether its KV pages are safe to release.
 
     Backend faults are contained here on purpose. This runs inside the scheduler
-    loop, and the barrier is a safety optimisation: letting a bug in it take the
-    whole engine down, or pin a request forever, is worse than releasing one
-    request's pages early and saying so.
+    loop, and permissive policies prefer releasing one request's pages early and
+    saying so over taking the whole engine down or pinning pages forever.
 
-    A KVTransferBarrierEscalation is not such a fault. It is the barrier
-    reporting that pages cannot be proven idle and must not be reused, so it is
-    propagated: swallowing it here would silently turn the strictest policy into
-    the most permissive one.
+    A fail-closed policy makes the opposite trade: an unexpected fault is not
+    proof that native transfer work stopped, so it escalates rather than silently
+    becoming the most permissive policy.
     """
     try:
         return int(poller.advance_failure_quiescence())
     except KVTransferBarrierEscalation:
         raise
-    except Exception:
+    except Exception as e:
+        if poller.fail_closed_on_quiescence_error():
+            raise KVTransferBarrierEscalation(
+                "Transfer quiescence check failed under a fail-closed policy; "
+                "refusing to release KV pages without proof"
+            ) from e
         logger.exception(
             "Transfer quiescence check failed; releasing the request's KV pages"
         )

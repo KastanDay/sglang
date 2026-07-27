@@ -88,10 +88,10 @@ class KVArgs:
 class KVTransferBarrierEscalation(RuntimeError):
     """Raised when KV pages cannot be proven idle and must not be reused.
 
-    Deliberately distinct from a backend fault: the poll path contains ordinary
-    exceptions and releases the request, but this one has to reach the scheduler.
-    Restarting is the only way to reclaim these pages safely, and the scheduler's
-    top-level handler already turns an exception into engine teardown.
+    Deliberately distinct from a backend fault that a permissive policy may
+    contain and release. This exception has to reach the scheduler. Restarting is
+    the only way to reclaim these pages safely, and the scheduler's top-level
+    handler already turns an exception into engine teardown.
     """
 
 
@@ -203,12 +203,16 @@ class BaseKVSender(ABC):
         each call returns ``True`` once no native work can still touch its KV
         pages. Backends without out-of-band transfer work keep the default.
 
-        Implementations must be idempotent, must not block the scheduler loop,
-        and must be *bounded*: a transport or peer that never confirms
-        quiescence has to eventually return ``True`` rather than pinning the
-        request, and its pages, forever.
+        Implementations must be idempotent and must not block the scheduler loop.
+        A permissive policy must eventually return ``True`` rather than pinning
+        the request forever; a fail-closed policy may instead escalate so the
+        worker restarts without reusing pages that are not proven idle.
         """
         return True
+
+    def fail_closed_on_quiescence_error(self) -> bool:
+        """Whether an unexpected barrier fault must prevent page reuse."""
+        return False
 
     def is_failure_quiescing(self) -> bool:
         """
@@ -286,6 +290,10 @@ class BaseKVReceiver(ABC):
         prefill rank that was handed this request's page indices.
         """
         return True
+
+    def fail_closed_on_quiescence_error(self) -> bool:
+        """See ``BaseKVSender.fail_closed_on_quiescence_error``."""
+        return False
 
     def is_failure_quiescing(self) -> bool:
         """See ``BaseKVSender.is_failure_quiescing``."""

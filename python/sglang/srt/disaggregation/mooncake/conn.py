@@ -2583,6 +2583,9 @@ class MooncakeKVSender(CommonKVSender):
     def is_failure_quiescing(self) -> bool:
         return self._quiescing
 
+    def fail_closed_on_quiescence_error(self) -> bool:
+        return self.kv_mgr.transfer_barrier == TransferBarrierLevel.STRICT
+
     def advance_failure_quiescence(self) -> bool:
         self._close_barrier()
         if self.kv_mgr.transfer_barrier == TransferBarrierLevel.OFF:
@@ -2859,6 +2862,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
 
     def is_failure_quiescing(self) -> bool:
         return self._quiescing
+
+    def fail_closed_on_quiescence_error(self) -> bool:
+        return self.kv_mgr.transfer_barrier == TransferBarrierLevel.STRICT
 
     def advance_failure_quiescence(self) -> bool:
         self._close_barrier()

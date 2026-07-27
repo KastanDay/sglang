@@ -813,12 +813,11 @@ class TestNoUnboundedWaits(unittest.TestCase):
             "the ACK must be retried, not dropped",
         )
 
-    def test_a_backend_fault_releases_the_request_instead_of_the_engine(self):
-        # The barrier is a safety optimisation: a bug in it must not take down
-        # the scheduler, nor pin a request's pages forever.
+    def test_a_permissive_backend_fault_releases_the_request(self):
         poller = SimpleNamespace(
             poll=Mock(return_value=KVPoll.Failed),
             advance_failure_quiescence=Mock(side_effect=RuntimeError("backend bug")),
+            fail_closed_on_quiescence_error=Mock(return_value=False),
             is_failure_quiescing=Mock(return_value=True),
         )
         with patch(
@@ -1083,6 +1082,18 @@ class TestBarrierLevels(unittest.TestCase):
             sender.advance_failure_quiescence()
         time.sleep(0.02)
 
+    def test_only_strict_fails_closed_on_barrier_faults(self):
+        for barrier, expected in (
+            (TransferBarrierLevel.OFF, False),
+            (TransferBarrierLevel.WARN, False),
+            (TransferBarrierLevel.STRICT, True),
+        ):
+            with self.subTest(barrier=barrier):
+                sender = make_sender(make_prefill_manager(barrier=barrier))
+                receiver = make_receiver(make_decode_manager(barrier=barrier))
+                self.assertEqual(sender.fail_closed_on_quiescence_error(), expected)
+                self.assertEqual(receiver.fail_closed_on_quiescence_error(), expected)
+
     def test_warn_releases_once_and_loudly(self):
         mgr, sender = self._stuck_sender(TransferBarrierLevel.WARN)
         self.assertFalse(sender.advance_failure_quiescence())
@@ -1160,17 +1171,22 @@ class TestStrictCannotBeDowngraded(unittest.TestCase):
             with self.assertRaises(KVTransferBarrierEscalation):
                 poll_and_all_reduce([poller], object())
 
-    def test_an_ordinary_backend_fault_is_still_contained(self):
+    def test_an_ordinary_backend_fault_escalates_when_fail_closed(self):
+        backend_error = RuntimeError("backend bug")
         poller = SimpleNamespace(
             poll=Mock(return_value=KVPoll.Failed),
-            advance_failure_quiescence=Mock(side_effect=RuntimeError("backend bug")),
+            advance_failure_quiescence=Mock(side_effect=backend_error),
+            fail_closed_on_quiescence_error=Mock(return_value=True),
             is_failure_quiescing=Mock(return_value=True),
         )
         with patch(
             "sglang.srt.disaggregation.utils.dist.all_reduce",
             side_effect=lambda tensor, **kw: None,
         ):
-            self.assertEqual(poll_and_all_reduce([poller], object()), [KVPoll.Failed])
+            with self.assertRaises(KVTransferBarrierEscalation) as cm:
+                poll_and_all_reduce([poller], object())
+        self.assertIs(cm.exception.__cause__, backend_error)
+        self.assertIn("refusing to release KV pages", str(cm.exception))
 
     def test_strict_does_not_accept_a_legacy_ack_as_proof(self):
         # A peer that predates the barrier acknowledges before draining, so its
@@ -1461,12 +1477,14 @@ class TestPollGating(unittest.TestCase):
         receiver = SimpleNamespace(
             poll=Mock(return_value=KVPoll.Failed),
             advance_failure_quiescence=Mock(return_value=False),
+            fail_closed_on_quiescence_error=Mock(return_value=True),
             is_failure_quiescing=Mock(return_value=True),
         )
         gated = HiCacheRestoreGatedKVReceiver(
             SimpleNamespace(kv_receiver=receiver, hicache_restore_status=None)
         )
         self.assertFalse(gated.advance_failure_quiescence())
+        self.assertTrue(gated.fail_closed_on_quiescence_error())
         self.assertTrue(gated.is_failure_quiescing())
 
 
