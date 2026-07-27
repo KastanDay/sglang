@@ -1,0 +1,35 @@
+python/sglang/srt/disaggregation/base/conn.py
+  s_a2952ac4a4018a::t_ee5d68ab1cf820 88-97
+python/sglang/srt/disaggregation/common/conn.py
+  s_a2952ac4a4018a::t_1fb75ef06b5138 205,730,733-749
+python/sglang/srt/disaggregation/common/staging_handler.py
+  s_a2952ac4a4018a::t_49d7bbfd128862 91-95,428-441,445-455,460,468-471
+python/sglang/srt/disaggregation/common/utils.py
+  s_a2952ac4a4018a::t_8e061a25f5ffc1 29-32
+python/sglang/srt/disaggregation/decode.py
+  s_a2952ac4a4018a::t_881dda1e7ed657 1888-1902
+python/sglang/srt/disaggregation/mooncake/conn.py
+  s_a2952ac4a4018a::t_0df542db0da315 20-25,58,90-94,200-212,229-232,352-355,357-359,462-476,492,516,518,538-556,623-630,634-640,686,691-701,710,713,716-719,746,787-832,844,847-852,1948,2404-2406,2432,2588,2592-2595,2599-2605,2609,2869,2872-2879,2882,2888-2891,2893-2898,2904-2908,2939-2943,2996-3004,3006
+python/sglang/srt/disaggregation/utils.py
+  s_a2952ac4a4018a::t_f2040d8fe60d27 17,151-152,155-159,163-164,241
+python/sglang/srt/environ.py
+  s_a2952ac4a4018a::t_cd283e8b358e1e 213-229,416-423,425-427
+test/registered/unit/disaggregation/test_transfer_ownership_barrier.py
+  s_a2952ac4a4018a::t_a17817c5da7ee4 24-27,45,54-56,61-64,81-89,102-106,138-140,146-149,158-280,434-439,593,1064-1392
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "505cfd4f9a52e79429e2f60565a6a5e2bfa58cfb",
+  "prompts": {},
+  "sessions": {
+    "s_a2952ac4a4018a": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_06a7403aaffewJTacNzWhtB3Or",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Kastan Day <kastan@cloudflare.com>"
+    }
+  }
+}
