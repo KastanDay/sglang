@@ -1,0 +1,19 @@
+test/registered/unit/disaggregation/test_transfer_ownership_barrier.py
+  s_9cdab725a4b980::t_9c0d2f104a2a41 816,820,1085-1096,1174-1175,1178-1179,1186-1189,1480,1487
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3993647421099a2aabf74e20de83695c7a86e8db",
+  "prompts": {},
+  "sessions": {
+    "s_9cdab725a4b980": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_05abfdd8cffeBhDm2HTEpL1PGr",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Kastan Day <kastan@cloudflare.com>"
+    }
+  }
+}
