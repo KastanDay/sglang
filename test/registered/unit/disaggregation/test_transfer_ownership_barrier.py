@@ -4,8 +4,8 @@ The barrier keeps a failed request's KV pages allocated until no native
 transfer work can still read or write them. The properties under test are:
 
 * pages stay owned while transfer work is in flight (safety);
-* ownership is always released eventually, even if a peer never answers
-  (liveness -- a wedged transport must not pin pages forever);
+* ownership is never released without proof, and too many unquiesced requests
+  escalate so the worker can be torn down safely;
 * the deferral only happens where the scheduler can handle it, and never
   weakens the failure diagnostics the operator sees.
 """
@@ -101,7 +101,6 @@ def make_sender(mgr, room=ROOM, status=KVPoll.WaitingForInput):
     sender.conclude_state = None
     sender._quiescing = False
     sender._quiesce_deadline = float("inf")
-    sender._quiesce_timed_out = False
     sender.trace_ctx = SimpleNamespace(
         abort=Mock(),
         trace_req_finish=Mock(),
@@ -507,25 +506,30 @@ class TestPrefillOwnership(unittest.TestCase):
         self.assertIsNone(mgr.try_lease_room(ROOM))
         self.assertNotIn(ROOM, mgr._room_registry.rooms())
 
-    def test_quiescence_is_bounded_when_a_transfer_never_returns(self):
+    def test_timeout_does_not_release_a_stuck_transfer(self):
         mgr = make_prefill_manager(quiesce_timeout=0.05)
         sender = make_sender(mgr)
         lifetime = mgr._room_registry.get(ROOM)
         self.assertTrue(lifetime.try_lease())  # never returned
 
+        clock = [0.0]
         with patch(
+            "sglang.srt.disaggregation.mooncake.conn.time.monotonic",
+            side_effect=lambda: clock[0],
+        ), patch(
             "sglang.srt.disaggregation.mooncake.conn.TRANSFER_QUIESCE_TIMEOUTS"
         ) as metric:
             self.assertFalse(sender.advance_failure_quiescence())
-            time.sleep(0.06)
-            self.assertTrue(
+            clock[0] = 0.06
+            self.assertFalse(
                 sender.advance_failure_quiescence(),
-                "a wedged transfer must not pin the request forever",
+                "a timeout is not proof that the native transfer stopped",
             )
             metric.inc.assert_called_once_with()
             # The timeout is reported once, not on every subsequent poll.
-            self.assertTrue(sender.advance_failure_quiescence())
+            self.assertFalse(sender.advance_failure_quiescence())
             metric.inc.assert_called_once_with()
+        self.assertIn(ROOM, mgr._unquiesced_rooms)
 
     def test_bootstrapping_sender_is_immediately_quiesced(self):
         # Nothing has been submitted, so the request can fail without any wait.
@@ -818,20 +822,6 @@ class TestNoUnboundedWaits(unittest.TestCase):
             "the ACK must be retried, not dropped",
         )
 
-    def test_a_backend_fault_releases_the_request_instead_of_the_engine(self):
-        # The barrier is a safety optimisation: a bug in it must not take down
-        # the scheduler, nor pin a request's pages forever.
-        poller = SimpleNamespace(
-            poll=Mock(return_value=KVPoll.Failed),
-            advance_failure_quiescence=Mock(side_effect=RuntimeError("backend bug")),
-            is_failure_quiescing=Mock(return_value=True),
-        )
-        with patch(
-            "sglang.srt.disaggregation.utils.dist.all_reduce",
-            side_effect=lambda tensor, **kw: None,
-        ):
-            self.assertEqual(poll_and_all_reduce([poller], object()), [KVPoll.Failed])
-
     @staticmethod
     def _bookkeeping_thread():
         return next(
@@ -1029,30 +1019,31 @@ class TestDecodeOwnership(unittest.TestCase):
         self.assertNotIn(tokens[1], receiver._ack_barrier._exposed)
         self.assertNotIn(tokens[2], receiver._ack_barrier._exposed)
 
-    def test_quiescence_is_bounded_when_a_peer_never_acknowledges(self):
+    def test_timeout_never_releases_without_a_peer_ack(self):
         mgr = make_decode_manager(quiesce_timeout=0.05)
         receiver = make_receiver(mgr, bootstrap_infos=[{"rank": 0}])
 
+        clock = [0.0]
         with patch(
+            "sglang.srt.disaggregation.mooncake.conn.time.monotonic",
+            side_effect=lambda: clock[0],
+        ), patch(
             "sglang.srt.disaggregation.mooncake.conn.TRANSFER_QUIESCE_TIMEOUTS"
         ) as metric:
             self.assertFalse(receiver.advance_failure_quiescence())
-            time.sleep(0.06)
-            self.assertTrue(
-                receiver.advance_failure_quiescence(),
-                "a dead prefill must not pin decode pages forever",
-            )
-            metric.inc.assert_called_once_with()
+            clock[0] = 0.06
+            self.assertFalse(receiver.advance_failure_quiescence())
+        metric.inc.assert_called_once_with()
+        self.assertIn(ROOM, mgr._unquiesced_rooms)
 
-    def test_legacy_prefill_ack_stops_the_wait(self):
+    def test_legacy_prefill_ack_never_proves_quiescence(self):
         # A prefill that predates the barrier ACKs immediately and without a
-        # nonce. It cannot promise a drain, so waiting for it is pointless;
-        # degrade to the previous behaviour instead of stalling.
+        # nonce. It cannot promise a drain, so decode must keep its pages.
         mgr = make_decode_manager()
         receiver = make_receiver(mgr, bootstrap_infos=[{"rank": 0}])
         self.assertFalse(receiver.advance_failure_quiescence())
         receiver.record_abort_ack(None)
-        self.assertTrue(receiver.advance_failure_quiescence())
+        self.assertFalse(receiver.advance_failure_quiescence())
 
     def test_legacy_ack_does_not_satisfy_a_token_aware_peer(self):
         mgr = make_decode_manager()
@@ -1074,7 +1065,10 @@ class TestDecodeOwnership(unittest.TestCase):
         )
 
         receiver.record_abort_ack(tokens["current"])
-        self.assertTrue(receiver.advance_failure_quiescence())
+        self.assertFalse(
+            receiver.advance_failure_quiescence(),
+            "the legacy peer still has not proven that its write stopped",
+        )
 
     def test_stale_ack_for_another_request_is_ignored(self):
         mgr = make_decode_manager()
@@ -1134,8 +1128,7 @@ class TestDecodeOwnership(unittest.TestCase):
 class TestBarrierLevels(unittest.TestCase):
     """What happens when proof of quiescence never arrives.
 
-    WARN trades a narrow, loud corruption window for liveness; STRICT refuses to
-    reuse a page it cannot prove is idle, and escalates instead.
+    Every enabled barrier refuses to reuse a page it cannot prove is idle.
     """
 
     def _stuck_sender(self, barrier, max_unquiesced=256):
@@ -1148,49 +1141,38 @@ class TestBarrierLevels(unittest.TestCase):
 
     @staticmethod
     def _arm_and_expire(sender):
-        """Arm the deadline, then let it pass."""
-        with patch("sglang.srt.disaggregation.mooncake.conn.TRANSFER_QUIESCE_TIMEOUTS"):
-            sender.advance_failure_quiescence()
-        time.sleep(0.02)
+        """Close the barrier and place its deadline in the past."""
+        sender._close_barrier()
+        sender._quiesce_deadline = float("-inf")
 
-    def test_warn_releases_once_and_loudly(self):
-        mgr, sender = self._stuck_sender(TransferBarrierLevel.WARN)
-        self.assertFalse(sender.advance_failure_quiescence())
-        time.sleep(0.02)
-        with patch(
-            "sglang.srt.disaggregation.mooncake.conn.TRANSFER_QUIESCE_TIMEOUTS"
-        ) as metric:
-            self.assertTrue(sender.advance_failure_quiescence())
-            self.assertTrue(sender.advance_failure_quiescence())
-            metric.inc.assert_called_once_with()
+    def test_enabled_levels_never_release_without_proof(self):
+        for level in (TransferBarrierLevel.WARN, TransferBarrierLevel.STRICT):
+            with self.subTest(level=level):
+                mgr, sender = self._stuck_sender(level)
+                self._arm_and_expire(sender)
+                with patch(
+                    "sglang.srt.disaggregation.mooncake.conn.TRANSFER_QUIESCE_TIMEOUTS"
+                ) as metric, patch(
+                    "sglang.srt.disaggregation.mooncake.conn.logger.error"
+                ) as error:
+                    for _ in range(5):
+                        self.assertFalse(
+                            sender.advance_failure_quiescence(),
+                            "an enabled barrier must not release unproven pages",
+                        )
+                metric.inc.assert_called_once_with()
+                error.assert_called_once()
+                self.assertIn(ROOM, mgr._unquiesced_rooms)
 
-    def test_strict_never_releases_without_proof(self):
-        mgr, sender = self._stuck_sender(TransferBarrierLevel.STRICT)
-        self._arm_and_expire(sender)
-        with patch(
-            "sglang.srt.disaggregation.mooncake.conn.TRANSFER_QUIESCE_TIMEOUTS"
-        ) as metric:
-            with patch("sglang.srt.disaggregation.mooncake.conn.logger.error") as error:
-                for _ in range(5):
-                    self.assertFalse(
-                        sender.advance_failure_quiescence(),
-                        "STRICT must not hand back a page it cannot prove is idle",
-                    )
-        metric.inc.assert_called_once_with()
-        error.assert_called_once()
-        self.assertIn(
-            ROOM, mgr._unquiesced_rooms, "the stuck room must be tracked for escalation"
-        )
-
-    def test_strict_escalates_rather_than_leaking_forever(self):
+    def test_enabled_barrier_escalates_at_the_stuck_request_cap(self):
         # Withholding pages is only safe while there are few of them; past the
         # cap the worker fails so a restart reclaims them all at once.
-        mgr, sender = self._stuck_sender(TransferBarrierLevel.STRICT, max_unquiesced=2)
+        mgr, sender = self._stuck_sender(TransferBarrierLevel.WARN, max_unquiesced=2)
         self._arm_and_expire(sender)
         with patch("sglang.srt.disaggregation.mooncake.conn.TRANSFER_QUIESCE_TIMEOUTS"):
             sender.advance_failure_quiescence()
         mgr._unquiesced_rooms.add(999)  # a second stuck request
-        with self.assertRaises(RuntimeError) as cm:
+        with self.assertRaises(KVTransferBarrierEscalation) as cm:
             mgr.release_without_proof(1234, "third stuck request")
         self.assertIn("cannot be proven quiesced", str(cm.exception))
 
@@ -1215,13 +1197,12 @@ class TestBarrierLevels(unittest.TestCase):
         self.assertTrue(receiver.advance_failure_quiescence())
 
 
-class TestStrictCannotBeDowngraded(unittest.TestCase):
-    """STRICT must not degrade into the most permissive policy by accident."""
+class TestBarrierCannotFailOpen(unittest.TestCase):
+    """Barrier failures must coordinate teardown, never page reuse."""
 
     def test_escalation_reaches_the_scheduler(self):
-        # The poll path contains backend faults so a bug cannot kill the engine.
-        # The escalation is not a bug: swallowing it would release exactly the
-        # pages STRICT exists to withhold.
+        # A local escalation must reach the coordination point before raising;
+        # otherwise peers can hang in the second collective.
         poller = SimpleNamespace(
             poll=Mock(return_value=KVPoll.Failed),
             advance_failure_quiescence=Mock(
@@ -1263,7 +1244,7 @@ class TestStrictCannotBeDowngraded(unittest.TestCase):
                 poll_and_all_reduce([poller], object())
         self.assertEqual(collective.call_count, 2)
 
-    def test_an_ordinary_backend_fault_is_still_contained(self):
+    def test_an_ordinary_backend_fault_escalates_after_coordination(self):
         poller = SimpleNamespace(
             poll=Mock(return_value=KVPoll.Failed),
             advance_failure_quiescence=Mock(side_effect=RuntimeError("backend bug")),
@@ -1272,23 +1253,22 @@ class TestStrictCannotBeDowngraded(unittest.TestCase):
         with patch(
             "sglang.srt.disaggregation.utils.dist.all_reduce",
             side_effect=lambda tensor, **kw: None,
-        ):
-            self.assertEqual(poll_and_all_reduce([poller], object()), [KVPoll.Failed])
+        ) as all_reduce:
+            with self.assertRaises(KVTransferBarrierEscalation) as cm:
+                poll_and_all_reduce([poller], object())
+        self.assertIsInstance(cm.exception.__cause__, RuntimeError)
+        self.assertEqual(all_reduce.call_count, 2)
 
-    def test_strict_does_not_accept_a_legacy_ack_as_proof(self):
+    def test_enabled_barriers_do_not_accept_a_legacy_ack_as_proof(self):
         # A peer that predates the barrier acknowledges before draining, so its
-        # ACK proves nothing. WARN accepts it to keep a rolling upgrade working;
-        # STRICT cannot, by definition.
-        for level, accepted in (
-            (TransferBarrierLevel.WARN, True),
-            (TransferBarrierLevel.STRICT, False),
-        ):
+        # ACK proves nothing under either enabled policy.
+        for level in (TransferBarrierLevel.WARN, TransferBarrierLevel.STRICT):
             with self.subTest(level=level):
                 mgr = make_decode_manager(barrier=level)
                 receiver = make_receiver(mgr, bootstrap_infos=[{"rank": 0}])
                 receiver.advance_failure_quiescence()
                 receiver.record_abort_ack(None)
-                self.assertEqual(receiver._peers_quiesced(), accepted)
+                self.assertFalse(receiver._peers_quiesced())
 
 
 class TestRoomStateRetirement(unittest.TestCase):
@@ -1442,9 +1422,7 @@ class TestRoomCollisionIsolation(unittest.TestCase):
         self.assertIs(mgr._receivers[ROOM], owner)
         self.assertEqual(loser.poll(), KVPoll.Failed)
         self.assertFalse(loser._owns_room)
-        # The only shared write a loser may make is the monotonic status floor
-        # from the common initializer, which cannot regress the owner's status.
-        mgr.update_status.assert_called_once_with(ROOM, KVPoll.Bootstrapping)
+        mgr.update_status.assert_not_called()
         mgr.record_failure.assert_not_called()
         self.assertEqual(mgr.addr_to_rooms_tracker["prefill:1"], {ROOM})
 
@@ -1455,6 +1433,21 @@ class TestRoomCollisionIsolation(unittest.TestCase):
         mgr.update_status.assert_not_called()
         mgr.record_failure.assert_not_called()
         self.assertEqual(mgr.required_prefill_response_num_table, {})
+        self.assertIs(mgr._receivers[ROOM], owner)
+
+    def test_collision_loser_cannot_resurrect_a_failed_owner(self):
+        mgr = make_decode_manager()
+        mgr.get_session_id = Mock(side_effect=["owner", "loser"])
+        mgr.addr_to_rooms_tracker = {"prefill:1": set()}
+
+        owner = MooncakeKVReceiver(mgr, "prefill:1", ROOM)
+        mgr.request_status[ROOM] = KVPoll.Failed
+        mgr.update_status = MooncakeKVManager.update_status.__get__(mgr)
+
+        loser = MooncakeKVReceiver(mgr, "prefill:1", ROOM)
+
+        self.assertEqual(mgr.request_status[ROOM], KVPoll.Failed)
+        self.assertEqual(loser.poll(), KVPoll.Failed)
         self.assertIs(mgr._receivers[ROOM], owner)
 
     def test_the_loser_does_not_tear_down_shared_state(self):

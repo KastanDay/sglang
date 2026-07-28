@@ -233,7 +233,7 @@ class MooncakeKVManager(CommonKVManager):
         self.transfer_barrier = TransferBarrierLevel(
             envs.SGLANG_DISAGGREGATION_TRANSFER_BARRIER.get()
         )
-        # WARN releases after this long without proof; STRICT never does.
+        # After this long, enabled barriers report and track the stalled room.
         self.quiesce_timeout = envs.SGLANG_DISAGGREGATION_QUIESCE_TIMEOUT.get()
         self.max_unquiesced = envs.SGLANG_DISAGGREGATION_MAX_UNQUIESCED.get()
         self._unquiesced_rooms: set = set()
@@ -603,20 +603,11 @@ class MooncakeKVManager(CommonKVManager):
     def release_without_proof(self, room: int, reason: str) -> bool:
         """Whether *room* may release its KV pages without proof of quiescence.
 
-        WARN trades a narrow, loud corruption window for liveness. STRICT refuses,
-        and fails the worker once too many requests are stuck, because a restart
-        releases every page safely while a silent overwrite does not.
+        Every enabled barrier level refuses. Once too many requests are stuck,
+        fail the worker because a restart releases every page safely while a
+        silent overwrite does not.
         """
-        if self.transfer_barrier != TransferBarrierLevel.STRICT:
-            TRANSFER_QUIESCE_TIMEOUTS.inc()
-            logger.error(
-                "Releasing KV pages for bootstrap_room=%s without proof that "
-                "transfer work stopped: %s. An in-flight write may still land in "
-                "them. Set SGLANG_DISAGGREGATION_TRANSFER_BARRIER=2 to refuse "
-                "instead.",
-                room,
-                reason,
-            )
+        if self.transfer_barrier == TransferBarrierLevel.OFF:
             return True
 
         with self._unquiesced_lock:
@@ -627,7 +618,8 @@ class MooncakeKVManager(CommonKVManager):
             TRANSFER_QUIESCE_TIMEOUTS.inc()
             logger.error(
                 "Withholding KV pages for bootstrap_room=%s: %s (%d/%d requests "
-                "stuck). STRICT will not reuse a page it cannot prove is idle.",
+                "stuck). The transfer barrier will not reuse a page it cannot "
+                "prove is idle.",
                 room,
                 reason,
                 stuck,
@@ -2340,7 +2332,6 @@ class MooncakeKVSender(CommonKVSender):
         self.init_time = time.time()
         self._quiescing = False
         self._quiesce_deadline = float("inf")
-        self._quiesce_timed_out = False
         # Join the room's ownership barrier, which decode metadata may already
         # have created, and fail fast if an abort got here first.
         if not self.kv_mgr.open_room_transfers(self.bootstrap_room):
@@ -2426,18 +2417,13 @@ class MooncakeKVSender(CommonKVSender):
         if lifetime is None or lifetime.is_quiesced():
             self.kv_mgr.forget_unquiesced(self.bootstrap_room)
             return True
-        if self._quiesce_timed_out:
-            # WARN already decided to release; do not re-report it every poll.
-            return True
         if time.monotonic() < self._quiesce_deadline:
             return False
-        released = self.kv_mgr.release_without_proof(
+        return self.kv_mgr.release_without_proof(
             self.bootstrap_room,
             f"{lifetime.outstanding_leases()} transfer worker(s) still hold it "
             f"after {self.kv_mgr.quiesce_timeout:.1f}s",
         )
-        self._quiesce_timed_out = released
-        return released
 
     def clear(self) -> None:
         super().clear()
@@ -2505,17 +2491,23 @@ class MooncakeKVReceiver(CommonKVReceiver):
         # be touched by the receiver that owns the room. A second live receiver
         # for the same bootstrap_room means the room numbers collided upstream:
         # everything keyed by room is then ambiguous, so the loser concludes
-        # Failed immediately. It still constructs normally -- the common
-        # initializer's shared writes are idempotent (address tracking) or
-        # monotonic (status) -- but init(), send_metadata(), abort(), and
-        # clear() all stop at the ownership check, so it can never publish
-        # destinations for the room or tear down the owner's state.
+        # Failed immediately without entering the common initializer, which
+        # writes shared room state.
         self.bootstrap_room = bootstrap_room
+        self.bootstrap_addr = bootstrap_addr
+        self.kv_mgr = mgr
         self._owns_room = mgr.register_receiver(self)
-        super().__init__(mgr, bootstrap_addr, bootstrap_room)
         if not self._owns_room:
-            logger.error("%s; failing the new receiver", self._collision_reason())
             self.conclude_state = KVPoll.Failed
+            self.require_staging = False
+            self.abort_notified = False
+            logger.error("%s; failing the new receiver", self._collision_reason())
+            return
+        try:
+            super().__init__(mgr, bootstrap_addr, bootstrap_room)
+        except Exception:
+            mgr.unregister_receiver(self)
+            raise
 
     def _collision_reason(self) -> str:
         return (
@@ -2733,27 +2725,20 @@ class MooncakeKVReceiver(CommonKVReceiver):
 
     def _peers_quiesced(self) -> bool:
         self._send_abort_notification()
-        # A tokenless ACK is never proof (see PeerAckBarrier.quiesced); WARN may
-        # credit it once for a rolling upgrade, STRICT never releases without
-        # proof.
-        return self._ack_barrier.quiesced(
-            credit_one_tokenless=self.kv_mgr.transfer_barrier
-            != TransferBarrierLevel.STRICT
-        )
+        # A tokenless ACK is never proof (see PeerAckBarrier.quiesced).
+        return self._ack_barrier.quiesced()
 
     def record_abort_ack(self, token: Optional[bytes]) -> None:
         if self._ack_barrier.record_ack(token):
             # A prefill that predates the ownership barrier acknowledges the
             # notification without echoing a nonce, and does so before its
-            # transfers have drained. It cannot promise quiescence. WARN can
-            # credit one such compatibility exception while still waiting
-            # for every token-aware peer; STRICT waits for proof or escalates.
+            # transfers have drained. It cannot promise quiescence, so no
+            # enabled barrier can count it as proof.
             logger.warning_once(
                 "Prefill peer acknowledged an abort without a transfer-quiescence "
                 "token, so it acknowledges before its transfers drain and cannot "
-                "prove quiescence. Upgrade the prefill instances; WARN will still "
-                "wait for every token-aware peer before crediting one legacy peer, "
-                "and STRICT will refuse to release without proof."
+                "prove quiescence. Upgrade the prefill instances; enabled transfer "
+                "barriers will refuse to release without proof."
             )
 
     def _send_abort_notification(self):

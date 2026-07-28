@@ -263,7 +263,6 @@ class PeerAckBarrier:
         self._targets: List[Tuple[dict, bytes]] = []
         self._exposed: set = set()
         self._acked: set = set()
-        self._tokenless_peer_acked = False
 
     def mint_targets(self, bootstrap_infos) -> List[Tuple[dict, bytes]]:
         """Per-peer abort nonces, minted once and reused across retries.
@@ -299,7 +298,6 @@ class PeerAckBarrier:
         """Record one ABORT_ACK. Returns True if it was tokenless."""
         with self._lock:
             if not token:
-                self._tokenless_peer_acked = True
                 return True
             if token in self._exposed:
                 self._acked.add(token)
@@ -318,17 +316,11 @@ class PeerAckBarrier:
         with self._lock:
             return len(self._exposed - self._acked), len(self._exposed)
 
-    def quiesced(self, credit_one_tokenless: bool) -> bool:
+    def quiesced(self) -> bool:
         """Whether every peer that saw our page indices has proven it stopped.
 
-        A tokenless ACK carries no source identity and may be a retry, so at
-        most *one* such peer can ever be credited -- crediting more would let
-        duplicates impersonate token-aware peers -- and only when the caller
-        allows proof-less release at all (WARN, never STRICT).
+        A tokenless legacy ACK is never counted: that peer acknowledges before
+        draining its transfers, so the ACK proves nothing about page ownership.
         """
         with self._lock:
-            if self._tokenless_peer_acked:
-                return credit_one_tokenless and len(self._acked) + 1 >= len(
-                    self._exposed
-                )
             return self._exposed <= self._acked

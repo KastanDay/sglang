@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import os
 import random
 from collections import deque
@@ -17,8 +16,6 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import KVTransferBarrierEscalation
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, is_npu
-
-logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -153,25 +150,19 @@ def _reduce_polls(polls: List[int], groups) -> List[int]:
 def _advance_quiescence(poller) -> int:
     """Ask one poller whether its KV pages are safe to release.
 
-    Backend faults are contained here on purpose. This runs inside the scheduler
-    loop, and the barrier is a safety optimisation: letting a bug in it take the
-    whole engine down, or pin a request forever, is worse than releasing one
-    request's pages early and saying so.
-
-    A KVTransferBarrierEscalation is not such a fault. It is the barrier
-    reporting that pages cannot be proven idle and must not be reused, so it is
-    propagated: swallowing it here would silently turn the strictest policy into
-    the most permissive one.
+    Any failure to establish quiescence is unsafe: native work may still hold a
+    raw pointer to these pages. Convert backend faults into the coordinated
+    escalation path rather than reporting unproven pages as releasable.
     """
     try:
         return int(poller.advance_failure_quiescence())
     except KVTransferBarrierEscalation:
         raise
-    except Exception:
-        logger.exception(
-            "Transfer quiescence check failed; releasing the request's KV pages"
-        )
-        return 1
+    except Exception as exc:
+        raise KVTransferBarrierEscalation(
+            "Transfer quiescence check failed; refusing to reuse unproven-idle "
+            "KV pages"
+        ) from exc
 
 
 def _gate_failures_on_quiescence(pollers, polls: List[int], groups) -> List[int]:
