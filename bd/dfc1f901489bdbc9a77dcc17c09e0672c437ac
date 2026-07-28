@@ -1,0 +1,23 @@
+python/sglang/srt/disaggregation/mooncake/conn.py
+  s_1787a638fb71e0::t_81bb944cf1541b 327-351,392,1571-1579,1690-1705
+python/sglang/srt/disaggregation/nixl/conn.py
+  s_1787a638fb71e0::t_2d2f6c6b1d3c99 571-595,2486-2496
+sgl-model-gateway/bindings/python/tests/test_mini_lb.py
+  s_1787a638fb71e0::t_1be48ddc85bcc8 1-25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "bddfc1f901489bdbc9a77dcc17c09e0672c437ac",
+  "prompts": {},
+  "sessions": {
+    "s_1787a638fb71e0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fa6c1-3964-71f0-b109-67e1ea3ce383",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Kastan Day <kastan@cloudflare.com>"
+    }
+  }
+}
