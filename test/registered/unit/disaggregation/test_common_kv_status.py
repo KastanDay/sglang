@@ -79,6 +79,7 @@ class TestCommonKVStatus(unittest.TestCase):
         sender = CommonKVSender(manager, "127.0.0.1:30000", 7, [], 0)
 
         sender.clear()
+        manager.mark_metadata_ready(7)
         CommonKVSender(manager, "127.0.0.1:30000", 7, [], 0)
 
         self.assertEqual(manager.request_status[7], KVPoll.Bootstrapping)
