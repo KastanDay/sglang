@@ -580,6 +580,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             mgr=self.kv_manager,
             bootstrap_addr=_bootstrap_addr(req),
             bootstrap_room=req.bootstrap_room,
+            request_id=req.rid,
         )
 
         decode_req = DecodeRequest(

@@ -79,6 +79,7 @@ class TransferInfo:
     required_dst_info_num: int
     is_dummy: bool
     decode_prefix_len: Optional[int] = None
+    request_id: Optional[str] = None
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -106,6 +107,9 @@ class TransferInfo:
             is_dummy=is_dummy,
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
+            ),
+            request_id=(
+                msg[9].decode("utf-8") if len(msg) > 9 and msg[9] != b"" else None
             ),
         )
 
@@ -1585,7 +1589,13 @@ class MooncakeKVManager(CommonKVManager):
                         TransferInfo.from_zmq(waiting_req_bytes)
                     )
                     # NOTE: after bootstrapping we can mark the req as waiting for input
-                    if len(self.transfer_infos[room]) == required_dst_info_num:
+                    request_ids = {
+                        info.request_id for info in self.transfer_infos[room].values()
+                    }
+                    if (
+                        len(self.transfer_infos[room]) == required_dst_info_num
+                        and len(request_ids) == 1
+                    ):
                         self.resolve_kv_replica_factor(self.transfer_infos[room])
                         self.req_to_decode_prefix_len[room] = next(
                             (
@@ -1595,7 +1605,8 @@ class MooncakeKVManager(CommonKVManager):
                             ),
                             0,
                         )
-                        self.update_status(room, KVPoll.WaitingForInput)
+                        request_id = next(iter(request_ids))
+                        self.mark_metadata_ready(room, request_id)
 
         threading.Thread(target=bootstrap_thread).start()
 
@@ -1779,6 +1790,7 @@ class MooncakeKVSender(CommonKVSender):
         dest_tp_ranks: List[int],
         pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
+        request_id: Optional[str] = None,
     ):
         super().__init__(
             mgr,
@@ -1787,6 +1799,7 @@ class MooncakeKVSender(CommonKVSender):
             dest_tp_ranks,
             pp_rank,
             req_has_disagg_prefill_dp_rank,
+            request_id,
         )
         self.conclude_state = None
         self.init_time = time.time()
@@ -1882,10 +1895,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
         mgr: MooncakeKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
+        request_id: Optional[str] = None,
     ):
         self.session_id = mgr.get_session_id()
         self.init_time = None
-        super().__init__(mgr, bootstrap_addr, bootstrap_room)
+        super().__init__(mgr, bootstrap_addr, bootstrap_room, request_id)
 
     def _register_kv_args(self):
         for bootstrap_info in self.bootstrap_infos:
@@ -1986,6 +2000,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
                         str(decode_prefix_len or 0).encode("ascii"),
+                        (self.request_id or "").encode("utf-8"),
                     ]
                 )
         self.init_time = time.time()

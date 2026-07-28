@@ -153,6 +153,7 @@ class TransferInfo:
     required_dst_info_num: int
     dst_state_indices: List[List[int]]
     decode_prefix_len: Optional[int] = None  # for decode radix cache
+    request_id: Optional[str] = None
     # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
     # end so positional construction in from_zmq() continues to work.
     staging: Optional[StagingTransferInfo] = None
@@ -184,6 +185,9 @@ class TransferInfo:
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
             ),  # hacky just add it into the message that will be sent
+            request_id=(
+                msg[9].decode("utf-8") if len(msg) > 9 and msg[9] != b"" else None
+            ),
         )
 
 
@@ -2436,7 +2440,13 @@ class NixlKVManager(CommonKVManager):
                     agent_name
                 ].required_dst_info_num
                 logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
-                if len(self.transfer_infos[room]) == required_dst_info_num:
+                request_ids = {
+                    info.request_id for info in self.transfer_infos[room].values()
+                }
+                if (
+                    len(self.transfer_infos[room]) == required_dst_info_num
+                    and len(request_ids) == 1
+                ):
                     self.resolve_kv_replica_factor(self.transfer_infos[room])
                     self.req_to_decode_prefix_len[room] = next(
                         (
@@ -2447,7 +2457,8 @@ class NixlKVManager(CommonKVManager):
                         0,
                     )
                     logger.debug(f"{room=} is bootstrapped")
-                    self.update_status(room, KVPoll.WaitingForInput)
+                    request_id = next(iter(request_ids))
+                    self.mark_metadata_ready(room, request_id)
 
         threading.Thread(target=bootstrap_thread).start()
 
@@ -2461,6 +2472,7 @@ class NixlKVSender(CommonKVSender):
         dest_tp_ranks: List[int],
         pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
+        request_id: Optional[str] = None,
     ):
         super().__init__(
             mgr,
@@ -2469,6 +2481,7 @@ class NixlKVSender(CommonKVSender):
             dest_tp_ranks,
             pp_rank,
             req_has_disagg_prefill_dp_rank,
+            request_id,
         )
         self.has_sent = False
         self.chunk_id = 0
@@ -2564,9 +2577,10 @@ class NixlKVReceiver(CommonKVReceiver):
         mgr: NixlKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
+        request_id: Optional[str] = None,
     ):
         self.started_transfer = False
-        super().__init__(mgr, bootstrap_addr, bootstrap_room)
+        super().__init__(mgr, bootstrap_addr, bootstrap_room, request_id)
         self.init_time = None
 
     def send_metadata(
@@ -2622,6 +2636,7 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(self.required_dst_info_num).encode("ascii"),
                         packed_state_indices,
                         str(decode_prefix_len or 0).encode("ascii"),
+                        (self.request_id or "").encode("utf-8"),
                     ]
                 )
 

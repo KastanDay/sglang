@@ -44,6 +44,7 @@ class FakeKVSender(BaseKVSender):
         dest_tp_ranks: List[int],
         pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
+        request_id: Optional[str] = None,
     ):
         self.kv_mgr = mgr
         self.has_sent = False
@@ -97,6 +98,7 @@ class FakeKVReceiver(BaseKVReceiver):
         mgr: BaseKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
+        request_id: Optional[str] = None,
     ):
         self.bootstrap_done = False
         self.has_sent_metadata = False
