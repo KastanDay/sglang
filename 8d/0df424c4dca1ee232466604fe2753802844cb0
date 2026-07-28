@@ -1,0 +1,23 @@
+python/sglang/srt/disaggregation/ascend/conn.py
+  s_43857d0b71bc75::t_c2bf473184dce7 189-216
+python/sglang/srt/disaggregation/mooncake/conn.py
+  s_43857d0b71bc75::t_a46f5c6f5fc4da 710-737,875-887,889-905
+test/registered/unit/disaggregation/test_kv_send_failure_drain.py
+  s_43857d0b71bc75::t_3feba9e444af21 14,73-98,103-245
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8d0df424c4dca1ee232466604fe2753802844cb0",
+  "prompts": {},
+  "sessions": {
+    "s_43857d0b71bc75": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019faad3-54be-7102-b314-4440c170ac09",
+        "model": "unknown"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    }
+  }
+}
