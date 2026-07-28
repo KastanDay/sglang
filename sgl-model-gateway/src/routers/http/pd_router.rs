@@ -234,6 +234,7 @@ impl PDRouter {
     const BOOTSTRAP_PORT_KEY: &'static str = "bootstrap_port";
     const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
     const DISAGG_PREFILL_DP_RANK_KEY: &'static str = "disagg_prefill_dp_rank";
+    const RID_KEY: &'static str = "rid";
 
     fn inject_bootstrap_into_value(
         mut original: Value,
@@ -243,15 +244,19 @@ impl PDRouter {
         let obj = original
             .as_object_mut()
             .ok_or_else(|| "Request must be a JSON object".to_string())?;
+        let inject_rid = obj.get(Self::RID_KEY).map_or(true, Value::is_null);
 
         if let Some(n) = batch_size {
             let mut hosts = Vec::with_capacity(n);
             let mut ports = Vec::with_capacity(n);
             let mut rooms = Vec::with_capacity(n);
+            let mut rids = Vec::with_capacity(n);
             for _ in 0..n {
                 hosts.push(prefill_worker.bootstrap_host());
                 ports.push(prefill_worker.bootstrap_port());
-                rooms.push(super::pd_types::generate_room_id());
+                let room = super::pd_types::generate_room_id();
+                rooms.push(room);
+                rids.push(format!("pd-{room}"));
             }
             // Use static string keys to avoid per-request allocations
             obj.insert(
@@ -274,6 +279,12 @@ impl PDRouter {
                 Self::BOOTSTRAP_ROOM_KEY.to_string(),
                 Value::Array(rooms.into_iter().map(Value::from).collect()),
             );
+            if inject_rid {
+                obj.insert(
+                    Self::RID_KEY.to_string(),
+                    Value::Array(rids.into_iter().map(Value::from).collect()),
+                );
+            }
         } else {
             // Use static string keys to avoid per-request allocations
             obj.insert(
@@ -287,10 +298,11 @@ impl PDRouter {
                     None => Value::Null,
                 },
             );
-            obj.insert(
-                Self::BOOTSTRAP_ROOM_KEY.to_string(),
-                Value::from(super::pd_types::generate_room_id()),
-            );
+            let room = super::pd_types::generate_room_id();
+            obj.insert(Self::BOOTSTRAP_ROOM_KEY.to_string(), Value::from(room));
+            if inject_rid {
+                obj.insert(Self::RID_KEY.to_string(), Value::from(format!("pd-{room}")));
+            }
         }
         Ok(original)
     }
@@ -1850,6 +1862,85 @@ mod tests {
             PDRouter::worker_endpoint_url(&worker, "/v1/models"),
             "http://prefill:30000/v1/models"
         );
+    }
+
+    #[test]
+    fn test_inject_bootstrap_generates_shared_request_id() {
+        let worker = create_test_worker(
+            "http://prefill:30000".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            },
+            true,
+        );
+
+        let body = PDRouter::inject_bootstrap_into_value(
+            json!({"model": "test-model"}),
+            worker.as_ref(),
+            None,
+        )
+        .expect("bootstrap fields should be injected");
+        let room = body["bootstrap_room"]
+            .as_u64()
+            .expect("room should be numeric");
+
+        assert_eq!(body["rid"], format!("pd-{room}"));
+    }
+
+    #[test]
+    fn test_inject_bootstrap_batch_request_ids_match_rooms() {
+        let worker = create_test_worker(
+            "http://prefill:30000".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            },
+            true,
+        );
+
+        let body = PDRouter::inject_bootstrap_into_value(
+            json!({"model": "test-model"}),
+            worker.as_ref(),
+            Some(2),
+        )
+        .expect("bootstrap fields should be injected");
+        let rooms = body["bootstrap_room"]
+            .as_array()
+            .expect("rooms should be an array");
+        let rids = body["rid"]
+            .as_array()
+            .expect("request ids should be an array");
+
+        assert_eq!(rooms.len(), 2);
+        assert_eq!(rids.len(), 2);
+        for (room, rid) in rooms.iter().zip(rids) {
+            assert_eq!(
+                rid,
+                &Value::from(format!(
+                    "pd-{}",
+                    room.as_u64().expect("room should be numeric")
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn test_inject_bootstrap_preserves_explicit_request_id() {
+        let worker = create_test_worker(
+            "http://prefill:30000".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            },
+            true,
+        );
+
+        let body = PDRouter::inject_bootstrap_into_value(
+            json!({"model": "test-model", "rid": "caller-rid"}),
+            worker.as_ref(),
+            None,
+        )
+        .expect("bootstrap fields should be injected");
+
+        assert_eq!(body["rid"], "caller-rid");
     }
 
     #[tokio::test]

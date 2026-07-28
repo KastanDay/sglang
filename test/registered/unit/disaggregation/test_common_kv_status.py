@@ -38,9 +38,7 @@ class TestCommonKVStatus(unittest.TestCase):
     def test_late_success_after_clear_does_not_resurrect_room(self):
         manager = self._manager()
         manager.is_dummy_cp_rank = True
-        sender = CommonKVSender(
-            manager, "127.0.0.1:30000", 7, [], 0, request_id="old"
-        )
+        sender = CommonKVSender(manager, "127.0.0.1:30000", 7, [], 0, request_id="old")
 
         sender.clear()
         manager.mark_metadata_ready(7, "old")
@@ -56,9 +54,7 @@ class TestCommonKVStatus(unittest.TestCase):
 
         manager.is_dummy_cp_rank = False
         manager.server_args = SimpleNamespace(dp_size=1)
-        CommonKVSender(
-            manager, "127.0.0.1:30000", 7, [], 0, request_id="new"
-        )
+        CommonKVSender(manager, "127.0.0.1:30000", 7, [], 0, request_id="new")
         self.assertEqual(manager.request_status[7], KVPoll.Bootstrapping)
 
     def test_dummy_cp_rank_initializes_waiting(self):
@@ -75,27 +71,21 @@ class TestCommonKVStatus(unittest.TestCase):
         manager.server_args = SimpleNamespace(dp_size=1)
         manager.mark_metadata_ready(7, "new")
 
-        CommonKVSender(
-            manager, "127.0.0.1:30000", 7, [], 0, request_id="new"
-        )
+        CommonKVSender(manager, "127.0.0.1:30000", 7, [], 0, request_id="new")
 
         self.assertEqual(manager.request_status[7], KVPoll.WaitingForInput)
 
     def test_reused_room_accepts_only_new_generation_metadata(self):
         manager = self._manager()
         manager.is_dummy_cp_rank = True
-        sender = CommonKVSender(
-            manager, "127.0.0.1:30000", 7, [], 0, request_id="old"
-        )
+        sender = CommonKVSender(manager, "127.0.0.1:30000", 7, [], 0, request_id="old")
         sender.clear()
 
         manager.mark_metadata_ready(7, "old")
         manager.mark_metadata_ready(7, "new")
         manager.is_dummy_cp_rank = False
         manager.server_args = SimpleNamespace(dp_size=1)
-        CommonKVSender(
-            manager, "127.0.0.1:30000", 7, [], 0, request_id="new"
-        )
+        CommonKVSender(manager, "127.0.0.1:30000", 7, [], 0, request_id="new")
 
         self.assertEqual(manager.request_status[7], KVPoll.WaitingForInput)
 
@@ -109,12 +99,77 @@ class TestCommonKVStatus(unittest.TestCase):
 
         manager.is_dummy_cp_rank = False
         manager.server_args = SimpleNamespace(dp_size=1)
-        CommonKVSender(
-            manager, "127.0.0.1:30000", 7, [], 0, request_id="new"
+        CommonKVSender(manager, "127.0.0.1:30000", 7, [], 0, request_id="new")
+        manager.transfer_infos = {7: {"new-peer": object()}}
+        manager.req_to_decode_prefix_len = {7: 5}
+        self.assertFalse(old_sender.clear())
+
+        self.assertEqual(manager.request_status[7], KVPoll.Bootstrapping)
+        self.assertIn(7, manager.transfer_infos)
+        self.assertEqual(manager.req_to_decode_prefix_len[7], 5)
+
+    def test_late_old_generation_status_cannot_complete_reused_room(self):
+        manager = self._manager()
+        manager.is_dummy_cp_rank = True
+        old_sender = CommonKVSender(
+            manager, "127.0.0.1:30000", 7, [], 0, request_id="old"
         )
         old_sender.clear()
 
+        manager.is_dummy_cp_rank = False
+        manager.server_args = SimpleNamespace(dp_size=1)
+        CommonKVSender(manager, "127.0.0.1:30000", 7, [], 0, request_id="new")
+
+        manager.update_status(7, KVPoll.Success, request_id="old")
+        manager.update_status(7, KVPoll.Success)
+
         self.assertEqual(manager.request_status[7], KVPoll.Bootstrapping)
+
+    def test_early_transfer_metadata_is_partitioned_by_generation(self):
+        manager = self._manager()
+        manager.transfer_infos = {}
+        old_info = SimpleNamespace(decode_prefix_len=3)
+        new_info = SimpleNamespace(decode_prefix_len=5)
+
+        manager.store_transfer_info(7, "old", "old-peer", old_info)
+        manager.store_transfer_info(7, "new", "new-peer", new_info)
+        manager.start_generation(7, "new")
+
+        self.assertEqual(manager.transfer_infos[7], {"new-peer": new_info})
+
+    def test_late_metadata_for_retired_generation_is_rejected(self):
+        manager = self._manager()
+        manager.transfer_infos = {}
+        manager.start_generation(7, "old")
+        manager.clear_status(7, "old")
+
+        result = manager.store_transfer_info(
+            7,
+            "old",
+            "late-peer",
+            SimpleNamespace(decode_prefix_len=3),
+        )
+
+        self.assertIsNone(result)
+        self.assertNotIn(7, manager.transfer_infos)
+
+    def test_metadata_cannot_mutate_generation_after_bootstrap(self):
+        manager = self._manager()
+        manager.transfer_infos = {}
+        first_info = SimpleNamespace(decode_prefix_len=3)
+        manager.start_generation(7, "current")
+        manager.store_transfer_info(7, "current", "first-peer", first_info)
+        manager.mark_metadata_ready(7, "current")
+
+        result = manager.store_transfer_info(
+            7,
+            "current",
+            "late-peer",
+            SimpleNamespace(decode_prefix_len=5),
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(manager.transfer_infos[7], {"first-peer": first_info})
 
     def test_concurrent_success_cannot_overwrite_failure(self):
         manager = self._manager(KVPoll.WaitingForInput)

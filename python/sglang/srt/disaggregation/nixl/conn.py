@@ -569,9 +569,9 @@ class NixlKVManager(CommonKVManager):
         room = int(msg[1].decode("ascii"))
         session_id = msg[4].decode("ascii")
         handler = self._staging_handler
-        assert (
-            handler is not None
-        ), "STAGING_REQ received before staging handler initialized"
+        assert handler is not None, (
+            "STAGING_REQ received before staging handler initialized"
+        )
         decode_req = handler._room_to_decode_req.get(room)
         if decode_req is None:
             logger.warning(
@@ -638,11 +638,22 @@ class NixlKVManager(CommonKVManager):
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
 
-    def update_status(self, bootstrap_room: int, status: KVPoll):
+    def update_status(
+        self,
+        bootstrap_room: int,
+        status: KVPoll,
+        request_id: Optional[str] = None,
+    ):
         # Keep Failed sticky until the sender clears the room.
         if self.request_status.get(bootstrap_room) == KVPoll.Failed:
             return
-        super().update_status(bootstrap_room, status)
+        super().update_status(bootstrap_room, status, request_id)
+
+    @staticmethod
+    def _notification_prefix(bootstrap_room: int, request_id: Optional[str]) -> str:
+        if not request_id:
+            return str(bootstrap_room)
+        return f"{bootstrap_room}_g{request_id.encode('utf-8').hex()}"
 
     def _prep_equal_tp_dlist(
         self,
@@ -691,9 +702,9 @@ class NixlKVManager(CommonKVManager):
             )
 
         prep_handle = self.agent.prep_xfer_dlist(peer_name, np.vstack(arrays), mem_kind)
-        assert (
-            prep_handle is not None
-        ), f"prep_xfer_dlist returned None for peer '{peer_name}'"
+        assert prep_handle is not None, (
+            f"prep_xfer_dlist returned None for peer '{peer_name}'"
+        )
         return prep_handle
 
     def _init_equal_tp_prep_handle(
@@ -821,9 +832,9 @@ class NixlKVManager(CommonKVManager):
                 ]
             )
             src_handle = self.agent.prep_xfer_dlist("", src_array, src_mem_kind)
-            assert (
-                src_handle is not None
-            ), f"prep_xfer_dlist returned None for slice src (decode_tp_size={decode_tp_size})"
+            assert src_handle is not None, (
+                f"prep_xfer_dlist returned None for slice src (decode_tp_size={decode_tp_size})"
+            )
             self.prep_handle_slice_src = (
                 src_handle,
                 num_groups,
@@ -858,9 +869,9 @@ class NixlKVManager(CommonKVManager):
             ]
         )
         dst_handle = self.agent.prep_xfer_dlist(peer_name, dst_array, dst_mem_kind)
-        assert (
-            dst_handle is not None
-        ), f"prep_xfer_dlist returned None for slice dst for peer '{peer_name}'"
+        assert dst_handle is not None, (
+            f"prep_xfer_dlist returned None for slice dst for peer '{peer_name}'"
+        )
         self.prep_handles_slice_dst[peer_name] = (
             dst_handle,
             num_slots_dst,
@@ -1018,7 +1029,10 @@ class NixlKVManager(CommonKVManager):
             room = kv_chunk.room
             handles: List[Any] = []
             try:
-                if self.check_status(room) == KVPoll.Failed:
+                if (
+                    not self.is_current_generation(room, kv_chunk.request_id)
+                    or self.check_status(room) == KVPoll.Failed
+                ):
                     continue
 
                 assert room in self.transfer_infos
@@ -1032,9 +1046,16 @@ class NixlKVManager(CommonKVManager):
                 ):
                     staging_strategy = self._try_create_staging_strategy(staging_buffer)
 
-                self.update_status(room, KVPoll.Transferring)
+                self.update_status(
+                    room,
+                    KVPoll.Transferring,
+                    request_id=kv_chunk.request_id,
+                )
 
                 reqs_to_be_processed = list(self.transfer_infos[room].values())
+                notification_prefix = self._notification_prefix(
+                    room, kv_chunk.request_id
+                )
 
                 # Set when staging allocation/watermark is not yet ready and
                 # the chunk has been re-enqueued. We then break out of the
@@ -1072,7 +1093,7 @@ class NixlKVManager(CommonKVManager):
                         src_prefill_kv_indices = kv_chunk.prefill_kv_indices
 
                         notif = (
-                            f"{req.room}_kv_{kv_chunk.chunk_id}"
+                            f"{notification_prefix}_kv_{kv_chunk.chunk_id}"
                             f"_{int(kv_chunk.is_last_chunk)}_{self.kv_args.engine_rank}"
                         )
 
@@ -1160,7 +1181,7 @@ class NixlKVManager(CommonKVManager):
                                 dst_info.dst_state_data_ptrs,
                                 req.dst_state_indices,
                                 dst_info.gpu_id,
-                                f"{req.room}_state_{self.kv_args.engine_rank}",
+                                f"{notification_prefix}_state_{self.kv_args.engine_rank}",
                                 decode_tp_size,
                                 decode_tp_rank=dst_info.decode_tp_rank,
                                 dst_state_item_lens=dst_info.dst_state_item_lens,
@@ -1176,11 +1197,9 @@ class NixlKVManager(CommonKVManager):
                         # encode pp_rank in aux notif so receiver can mark
                         # expected_kvs_per_pp[pp_rank] = 0.
                         if len(kv_chunk.prefill_kv_indices) == 0:
-                            aux_notif = (
-                                f"{req.room}_aux_nokv_{self.kv_args.engine_rank}"
-                            )
+                            aux_notif = f"{notification_prefix}_aux_nokv_{self.kv_args.engine_rank}"
                         else:
-                            aux_notif = f"{req.room}_aux"
+                            aux_notif = f"{notification_prefix}_aux"
                         aux_xfer_handle = self.send_aux(
                             req.agent_name,
                             kv_chunk.prefill_aux_index,
@@ -1209,20 +1228,31 @@ class NixlKVManager(CommonKVManager):
                     time.sleep(0)
 
                 if kv_chunk.is_last_chunk:
-                    self.update_status(room, KVPoll.Success)
-                    # Drop per-room state on Success (parity with mooncake
-                    # transfer_worker; staging prefetch sets are NIXL-only).
-                    self.transfer_infos.pop(room, None)
-                    self.req_to_decode_prefix_len.pop(room, None)
-                    if self.enable_staging and self._staging_ctx is not None:
-                        self._staging_ctx.prefetched_rooms.discard(room)
-                        self._staging_ctx.prefetch_requested = {
-                            k
-                            for k in self._staging_ctx.prefetch_requested
-                            if k[0] != room
-                        }
+                    with self._get_request_status_lock():
+                        if not self.is_current_generation(room, kv_chunk.request_id):
+                            continue
+                        self.update_status(
+                            room,
+                            KVPoll.Success,
+                            request_id=kv_chunk.request_id,
+                        )
+                        # Drop per-room state on Success (parity with mooncake
+                        # transfer_worker; staging prefetch sets are NIXL-only).
+                        self.transfer_infos.pop(room, None)
+                        self.req_to_decode_prefix_len.pop(room, None)
+                        if self.enable_staging and self._staging_ctx is not None:
+                            self._staging_ctx.prefetched_rooms.discard(room)
+                            self._staging_ctx.prefetch_requested = {
+                                k
+                                for k in self._staging_ctx.prefetch_requested
+                                if k[0] != room
+                            }
                 else:
-                    self.update_status(room, KVPoll.Transferring)
+                    self.update_status(
+                        room,
+                        KVPoll.Transferring,
+                        request_id=kv_chunk.request_id,
+                    )
             except Exception as e:
                 # Catch all exceptions to prevent silently killing this
                 # worker thread, but still propagate via failure_exception().
@@ -1232,9 +1262,14 @@ class NixlKVManager(CommonKVManager):
                     logger.exception(
                         f"Unexpected transfer worker error for room {room}"
                     )
-                self.exceptions[room] = e
-                self.record_failure(room, str(e))
-                self.update_status(room, KVPoll.Failed)
+                if self.is_current_generation(room, kv_chunk.request_id):
+                    self.exceptions[room] = e
+                    self.record_failure(room, str(e), request_id=kv_chunk.request_id)
+                    self.update_status(
+                        room,
+                        KVPoll.Failed,
+                        request_id=kv_chunk.request_id,
+                    )
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -1758,7 +1793,8 @@ class NixlKVManager(CommonKVManager):
             return (None, True)
 
         notif_tag = (
-            f"{req.room}_stg_{kv_chunk.chunk_id}_{int(kv_chunk.is_last_chunk)}"
+            f"{self._notification_prefix(req.room, kv_chunk.request_id)}"
+            f"_stg_{kv_chunk.chunk_id}_{int(kv_chunk.is_last_chunk)}"
             f"_{self.kv_args.engine_rank}_{chunk_idx}"
             f"_{page_start}_{num_pages}_{req.agent_name}"
         )
@@ -1827,9 +1863,9 @@ class NixlKVManager(CommonKVManager):
     ):
         """Transfer Mamba states via RDMA."""
         assert len(prefill_state_indices) == 1, "Mamba should have single state index"
-        assert len(dst_state_indices) == len(
-            prefill_state_indices
-        ), "State indices count mismatch between Prefill and Decode"
+        assert len(dst_state_indices) == len(prefill_state_indices), (
+            "State indices count mismatch between Prefill and Decode"
+        )
 
         src_addrs = []
         dst_addrs = []
@@ -2133,6 +2169,7 @@ class NixlKVManager(CommonKVManager):
         chunk_id: int,
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
+        request_id: Optional[str] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2160,6 +2197,7 @@ class NixlKVManager(CommonKVManager):
                 chunk_id=chunk_id,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                request_id=request_id,
             )
         )
         return None
@@ -2170,42 +2208,62 @@ class NixlKVManager(CommonKVManager):
         for peer_name, messages in notif_map.items():
             for msg in messages:
                 # Notification tag layouts (underscore-separated):
+                # A generated request ID inserts `g{utf8_hex}_` after room.
                 #   kv:    {room}_kv_{chunk_id}_{is_last}_{pp_rank}             -> 5 fields
                 #   kvpart:{room}_kv_{chunk_id}_{is_last}_{pp_rank}_part_{i}_{n}-> 8 fields
                 #   stg:   {room}_stg_{chunk_id}_{is_last}_{pp_rank}_{chunk_idx}
                 #          _{page_start}_{num_pages}_{agent_name}               -> 9 fields
                 #   aux:   {room}_aux                                           -> 2 fields
                 #   state: {room}_state_{pp_rank}                               -> 3 fields
-                # maxsplit=8 keeps everything past the 8th underscore in the
-                # last component, so agent_name (which may itself contain
-                # underscores) lands intact in components[8] for the stg path.
-                components = msg.decode("ascii").split("_", 8)
-                room = int(components[0])
-                tag = components[1]
-                if tag == "kv":
-                    chunk_id = int(components[2])
-                    is_last_chunk = bool(int(components[3]))
-                    pp_rank = int(components[4]) if len(components) > 4 else 0
-                    if len(components) > 7 and components[5] == "part":
-                        self._track_kv_part_arrival(
+                # Splitting room/generation first lets the final maxsplit keep
+                # agent_name (which may contain underscores) intact.
+                room_text, remainder = msg.decode("ascii").split("_", 1)
+                room = int(room_text)
+                request_id = None
+                generation_and_tag = remainder.split("_", 1)
+                if len(generation_and_tag) == 2 and generation_and_tag[0].startswith(
+                    "g"
+                ):
+                    generation_token, remainder = generation_and_tag
+                    try:
+                        request_id = bytes.fromhex(generation_token[1:]).decode("utf-8")
+                    except (ValueError, UnicodeDecodeError):
+                        logger.warning(
+                            "Ignoring malformed NIXL generation token for room %s",
                             room,
-                            chunk_id,
-                            is_last_chunk,
-                            pp_rank,
-                            int(components[6]),
-                            int(components[7]),
                         )
-                    else:
-                        self._track_kv_arrival(room, chunk_id, is_last_chunk, pp_rank)
-                elif tag == "stg":
-                    self._handle_stg_notification(components, room)
-                elif tag == "aux":
-                    # main's "nokv" marker (decode-side radix cache hit):
-                    # mark expected_kvs_per_pp[pp_rank] = 0 for this rank.
-                    self._handle_aux_notification(room, components)
-                elif tag == "state":
-                    pp_rank = int(components[2]) if len(components) > 2 else 0
-                    self.transfer_statuses[room].received_state_per_pp.add(pp_rank)
+                        continue
+                with self._get_request_status_lock():
+                    if not self.is_current_generation(room, request_id):
+                        continue
+                    components = [room_text, *remainder.split("_", 7)]
+                    tag = components[1]
+                    if tag == "kv":
+                        chunk_id = int(components[2])
+                        is_last_chunk = bool(int(components[3]))
+                        pp_rank = int(components[4]) if len(components) > 4 else 0
+                        if len(components) > 7 and components[5] == "part":
+                            self._track_kv_part_arrival(
+                                room,
+                                chunk_id,
+                                is_last_chunk,
+                                pp_rank,
+                                int(components[6]),
+                                int(components[7]),
+                            )
+                        else:
+                            self._track_kv_arrival(
+                                room, chunk_id, is_last_chunk, pp_rank
+                            )
+                    elif tag == "stg":
+                        self._handle_stg_notification(components, room)
+                    elif tag == "aux":
+                        # main's "nokv" marker (decode-side radix cache hit):
+                        # mark expected_kvs_per_pp[pp_rank] = 0 for this rank.
+                        self._handle_aux_notification(room, components)
+                    elif tag == "state":
+                        pp_rank = int(components[2]) if len(components) > 2 else 0
+                        self.transfer_statuses[room].received_state_per_pp.add(pp_rank)
 
     def _handle_stg_notification(self, components, room: int):
         """Handle a staging RDMA notification tag.
@@ -2239,8 +2297,10 @@ class NixlKVManager(CommonKVManager):
             pp_rank = int(components[3])
             self.transfer_statuses[room].expected_kvs_per_pp[pp_rank] = 0
         if self.transfer_statuses[room].num_pp_ranks_expected is None:
-            self.transfer_statuses[room].num_pp_ranks_expected = (
-                self.required_prefill_response_num_table.get(room, 1)
+            self.transfer_statuses[
+                room
+            ].num_pp_ranks_expected = self.required_prefill_response_num_table.get(
+                room, 1
             )
         if (
             self.enable_staging
@@ -2257,8 +2317,10 @@ class NixlKVManager(CommonKVManager):
         if is_last_chunk:
             self.transfer_statuses[room].expected_kvs_per_pp[pp_rank] = chunk_id + 1
             if self.transfer_statuses[room].num_pp_ranks_expected is None:
-                self.transfer_statuses[room].num_pp_ranks_expected = (
-                    self.required_prefill_response_num_table.get(room, 1)
+                self.transfer_statuses[
+                    room
+                ].num_pp_ranks_expected = self.required_prefill_response_num_table.get(
+                    room, 1
                 )
             if (
                 self.enable_staging
@@ -2357,19 +2419,25 @@ class NixlKVManager(CommonKVManager):
 
         try:
             room_to_be_aborted = int(msg[1].decode("ascii"))
+            request_id = msg[4].decode("utf-8") if len(msg) > 4 else None
         except Exception as e:
             logger.debug(f"Ignoring malformed abort notification: {e}")
             return True
 
         if (
-            room_to_be_aborted in self.request_status
+            self.is_current_generation(room_to_be_aborted, request_id)
             and self.check_status(room_to_be_aborted) != KVPoll.Success
         ):
             self.record_failure(
                 room_to_be_aborted,
                 "Aborted by decode-side abort notification.",
+                request_id=request_id,
             )
-            self.update_status(room_to_be_aborted, KVPoll.Failed)
+            self.update_status(
+                room_to_be_aborted,
+                KVPoll.Failed,
+                request_id=request_id,
+            )
             logger.debug(
                 f"Received abort notification for room {room_to_be_aborted}, "
                 f"marked as Failed"
@@ -2417,9 +2485,9 @@ class NixlKVManager(CommonKVManager):
                 if self._handle_abort_notification(waiting_req_bytes):
                     continue
 
-                assert (
-                    waiting_req_bytes[0] == GUARD
-                ), f"First message should be {GUARD}. Foreign traffic?"
+                assert waiting_req_bytes[0] == GUARD, (
+                    f"First message should be {GUARD}. Foreign traffic?"
+                )
                 waiting_req_bytes = waiting_req_bytes[1:]
                 room = waiting_req_bytes[0].decode("ascii")
                 agent_name = waiting_req_bytes[3].decode("ascii")
@@ -2431,27 +2499,28 @@ class NixlKVManager(CommonKVManager):
                     logger.debug(f"Register KVArgs from {agent_name} successfully")
                     continue
                 room = int(room)
-                if room not in self.transfer_infos:
-                    self.transfer_infos[room] = {}
-                self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(
-                    waiting_req_bytes
+                transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
+                infos = self.store_transfer_info(
+                    room,
+                    transfer_info.request_id,
+                    agent_name,
+                    transfer_info,
                 )
-                required_dst_info_num = self.transfer_infos[room][
-                    agent_name
-                ].required_dst_info_num
+                if infos is None:
+                    logger.debug(
+                        "Ignoring transfer info for a stale generation of room %s",
+                        room,
+                    )
+                    continue
+                required_dst_info_num = infos[agent_name].required_dst_info_num
                 logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
-                request_ids = {
-                    info.request_id for info in self.transfer_infos[room].values()
-                }
-                if (
-                    len(self.transfer_infos[room]) == required_dst_info_num
-                    and len(request_ids) == 1
-                ):
-                    self.resolve_kv_replica_factor(self.transfer_infos[room])
+                request_ids = {info.request_id for info in infos.values()}
+                if len(infos) == required_dst_info_num and len(request_ids) == 1:
+                    self.resolve_kv_replica_factor(infos)
                     self.req_to_decode_prefix_len[room] = next(
                         (
                             info.decode_prefix_len
-                            for info in self.transfer_infos[room].values()
+                            for info in infos.values()
                             if info.decode_prefix_len is not None
                         ),
                         0,
@@ -2516,6 +2585,7 @@ class NixlKVSender(CommonKVSender):
             self.chunk_id,
             self.aux_index,
             state_indices,
+            self.request_id,
         )
         self._record_transfer_indices(kv_indices, state_indices)
         self.chunk_id += 1
@@ -2536,18 +2606,21 @@ class NixlKVSender(CommonKVSender):
             )
         return status
 
-    def clear(self) -> None:
-        super().clear()
-        if (
-            getattr(self.kv_mgr, "enable_staging", False)
-            and getattr(self.kv_mgr, "_staging_ctx", None) is not None
-        ):
-            self.kv_mgr._staging_ctx.prefetched_rooms.discard(self.bootstrap_room)
-            self.kv_mgr._staging_ctx.prefetch_requested = {
-                key
-                for key in self.kv_mgr._staging_ctx.prefetch_requested
-                if key[0] != self.bootstrap_room
-            }
+    def clear(self) -> bool:
+        with self.kv_mgr._get_request_status_lock():
+            if not super().clear():
+                return False
+            if (
+                getattr(self.kv_mgr, "enable_staging", False)
+                and getattr(self.kv_mgr, "_staging_ctx", None) is not None
+            ):
+                self.kv_mgr._staging_ctx.prefetched_rooms.discard(self.bootstrap_room)
+                self.kv_mgr._staging_ctx.prefetch_requested = {
+                    key
+                    for key in self.kv_mgr._staging_ctx.prefetch_requested
+                    if key[0] != self.bootstrap_room
+                }
+            return True
 
     def failure_exception(self):
         exc = self.kv_mgr.exceptions.pop(self.bootstrap_room, None)
@@ -2594,7 +2667,11 @@ class NixlKVReceiver(CommonKVReceiver):
             logger.error(
                 f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
             )
-            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            self.kv_mgr.update_status(
+                self.bootstrap_room,
+                KVPoll.Failed,
+                request_id=self.request_id,
+            )
             return
 
         # Register staging room bootstrap info for staging handler
@@ -2665,14 +2742,27 @@ class NixlKVReceiver(CommonKVReceiver):
             return timeout_result
 
         self.kv_mgr.update_transfer_status()
-        if self.kv_mgr.check_transfer_done(self.bootstrap_room):  # type: ignore
-            self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
-                self.bootstrap_room
-            )
-            self.conclude_state = KVPoll.Success
-            del self.kv_mgr.transfer_statuses[self.bootstrap_room]
-            return self.conclude_state  # type: ignore
+        with self.kv_mgr._get_request_status_lock():
+            if self.kv_mgr.is_current_generation(
+                self.bootstrap_room, self.request_id
+            ) and self.kv_mgr.check_transfer_done(self.bootstrap_room):
+                self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
+                    self.bootstrap_room
+                )
+                self.conclude_state = KVPoll.Success
+                self.kv_mgr.transfer_statuses.pop(self.bootstrap_room, None)
+                return self.conclude_state  # type: ignore
         return KVPoll.WaitingForInput  # type: ignore
+
+    def clear(self) -> bool:
+        with self.kv_mgr._get_request_status_lock():
+            if not super().clear():
+                return False
+            self.kv_mgr.transfer_statuses.pop(self.bootstrap_room, None)
+            chunk_writer_counts = getattr(self.kv_mgr, "_chunk_writer_counts", None)
+            if chunk_writer_counts is not None:
+                chunk_writer_counts.pop(self.bootstrap_room, None)
+            return True
 
     def _register_kv_args(self):
         for bootstrap_info in self.bootstrap_infos:

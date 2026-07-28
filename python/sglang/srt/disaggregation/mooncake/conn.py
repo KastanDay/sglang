@@ -140,8 +140,8 @@ class KVArgsRegisterInfo:
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
             mooncake_session_id=msg[3].decode("ascii"),
-            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
-            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
+            dst_kv_ptrs=list(struct.unpack(f"{len(msg[4]) // 8}Q", msg[4])),
+            dst_aux_ptrs=list(struct.unpack(f"{len(msg[5]) // 8}Q", msg[5])),
             dst_state_data_ptrs=unpack_int_lists(msg[6], "Q"),
             dst_tp_rank=int(msg[7].decode("ascii")),
             dst_attn_tp_size=int(msg[8].decode("ascii")),
@@ -325,9 +325,9 @@ class MooncakeKVManager(CommonKVManager):
         room = int(msg[1].decode("ascii"))
         session_id = msg[4].decode("ascii")
         handler = self._staging_handler
-        assert (
-            handler is not None
-        ), "STAGING_REQ received before staging handler initialized"
+        assert handler is not None, (
+            "STAGING_REQ received before staging handler initialized"
+        )
         decode_req = handler._room_to_decode_req.get(room)
         if decode_req is None:
             logger.warning(
@@ -1253,7 +1253,13 @@ class MooncakeKVManager(CommonKVManager):
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 
     def sync_status_to_decode_endpoint(
-        self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
+        self,
+        remote: str,
+        dst_port: int,
+        room: int,
+        status: int,
+        prefill_rank: int,
+        request_id: Optional[str] = None,
     ):
         na = NetworkAddress(remote, dst_port)
         self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
@@ -1261,6 +1267,7 @@ class MooncakeKVManager(CommonKVManager):
                 str(room).encode("ascii"),
                 str(status).encode("ascii"),
                 str(prefill_rank).encode("ascii"),
+                (request_id or "").encode("utf-8"),
             ]
         )
 
@@ -1290,7 +1297,7 @@ class MooncakeKVManager(CommonKVManager):
                     )
 
                 if (
-                    kv_chunk.room not in self.request_status
+                    not self.is_current_generation(kv_chunk.room, kv_chunk.request_id)
                     or self.check_status(kv_chunk.room) == KVPoll.Failed
                 ):
                     logger.debug(
@@ -1332,18 +1339,27 @@ class MooncakeKVManager(CommonKVManager):
                         # Early exit if the request has failed
                         with self.session_lock:
                             if req.mooncake_session_id in self.failed_sessions:
-                                self.record_failure(
-                                    kv_chunk.room,
-                                    f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
-                                )
-                                self.update_status(kv_chunk.room, KVPoll.Failed)
-                                self.sync_status_to_decode_endpoint(
-                                    req.endpoint,
-                                    req.dst_port,
-                                    req.room,
-                                    KVPoll.Failed,
-                                    prefill_unique_rank,
-                                )
+                                if self.is_current_generation(
+                                    kv_chunk.room, kv_chunk.request_id
+                                ):
+                                    self.record_failure(
+                                        kv_chunk.room,
+                                        f"Decode instance could be dead, remote mooncake session {req.mooncake_session_id} is not alive",
+                                        request_id=kv_chunk.request_id,
+                                    )
+                                    self.update_status(
+                                        kv_chunk.room,
+                                        KVPoll.Failed,
+                                        request_id=kv_chunk.request_id,
+                                    )
+                                    self.sync_status_to_decode_endpoint(
+                                        req.endpoint,
+                                        req.dst_port,
+                                        req.room,
+                                        KVPoll.Failed,
+                                        prefill_unique_rank,
+                                        kv_chunk.request_id,
+                                    )
                                 break
 
                         chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
@@ -1420,19 +1436,28 @@ class MooncakeKVManager(CommonKVManager):
                                     logger.error(
                                         f"Session {req.mooncake_session_id} failed."
                                     )
-                            self.record_failure(
-                                kv_chunk.room,
-                                f"Failed to send kv chunk of {kv_chunk.room} to "
-                                f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
-                            )
-                            self.update_status(kv_chunk.room, KVPoll.Failed)
-                            self.sync_status_to_decode_endpoint(
-                                req.endpoint,
-                                req.dst_port,
-                                req.room,
-                                KVPoll.Failed,
-                                prefill_unique_rank,
-                            )
+                            if self.is_current_generation(
+                                kv_chunk.room, kv_chunk.request_id
+                            ):
+                                self.record_failure(
+                                    kv_chunk.room,
+                                    f"Failed to send kv chunk of {kv_chunk.room} to "
+                                    f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
+                                    request_id=kv_chunk.request_id,
+                                )
+                                self.update_status(
+                                    kv_chunk.room,
+                                    KVPoll.Failed,
+                                    request_id=kv_chunk.request_id,
+                                )
+                                self.sync_status_to_decode_endpoint(
+                                    req.endpoint,
+                                    req.dst_port,
+                                    req.room,
+                                    KVPoll.Failed,
+                                    prefill_unique_rank,
+                                    kv_chunk.request_id,
+                                )
                             break
 
                         if kv_chunk.is_last_chunk:
@@ -1457,8 +1482,16 @@ class MooncakeKVManager(CommonKVManager):
 
                             # Only sync status when all the dst ranks have received the kvcache
                             if len(polls) == req.required_dst_info_num:
+                                if not self.is_current_generation(
+                                    kv_chunk.room, kv_chunk.request_id
+                                ):
+                                    break
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
-                                self.update_status(req.room, status)
+                                self.update_status(
+                                    req.room,
+                                    status,
+                                    request_id=kv_chunk.request_id,
+                                )
                                 for endpoint, dst_port, room in dst_ranks_infos:
                                     self.sync_status_to_decode_endpoint(
                                         endpoint,
@@ -1466,12 +1499,17 @@ class MooncakeKVManager(CommonKVManager):
                                         room,
                                         status,
                                         prefill_unique_rank,
+                                        kv_chunk.request_id,
                                     )
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
                         # Dummy request does not need to sync status to decode endpoint
                         if kv_chunk.is_last_chunk and req.room in self.request_status:
-                            self.update_status(req.room, KVPoll.Success)
+                            self.update_status(
+                                req.room,
+                                KVPoll.Success,
+                                request_id=kv_chunk.request_id,
+                            )
 
                     if self.enable_trace:
                         mooncake_trace_slice(
@@ -1490,13 +1528,13 @@ class MooncakeKVManager(CommonKVManager):
                 if staging_deferred:
                     continue
 
-                if (
-                    kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == KVPoll.Success
-                ):
-                    if kv_chunk.room in self.transfer_infos:
-                        self.transfer_infos.pop(kv_chunk.room)
-                    self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
+                with self._get_request_status_lock():
+                    if (
+                        self.is_current_generation(kv_chunk.room, kv_chunk.request_id)
+                        and self.check_status(kv_chunk.room) == KVPoll.Success
+                    ):
+                        self.transfer_infos.pop(kv_chunk.room, None)
+                        self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
@@ -1532,12 +1570,21 @@ class MooncakeKVManager(CommonKVManager):
                     room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
                     decode_ip = waiting_req_bytes[2].decode("ascii")
                     decode_port = int(waiting_req_bytes[3].decode("ascii"))
+                    request_id = (
+                        waiting_req_bytes[4].decode("utf-8")
+                        if len(waiting_req_bytes) > 4
+                        else None
+                    )
                     # No need to abort the room if it has already succeeded
                     if (
-                        room_to_be_aborted in self.request_status
+                        self.is_current_generation(room_to_be_aborted, request_id)
                         and self.check_status(room_to_be_aborted) != KVPoll.Success
                     ):
-                        self.update_status(room_to_be_aborted, KVPoll.Failed)
+                        self.update_status(
+                            room_to_be_aborted,
+                            KVPoll.Failed,
+                            request_id=request_id,
+                        )
                         logger.debug(
                             f"Received abort notification for room {room_to_be_aborted}, "
                             f"marked as Failed"
@@ -1582,25 +1629,27 @@ class MooncakeKVManager(CommonKVManager):
                 else:
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
-                    if room not in self.transfer_infos:
-                        self.transfer_infos[room] = {}
-
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
+                    transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
+                    infos = self.store_transfer_info(
+                        room,
+                        transfer_info.request_id,
+                        mooncake_session_id,
+                        transfer_info,
                     )
+                    if infos is None:
+                        logger.debug(
+                            "Ignoring transfer info for a stale generation of room %s",
+                            room,
+                        )
+                        continue
                     # NOTE: after bootstrapping we can mark the req as waiting for input
-                    request_ids = {
-                        info.request_id for info in self.transfer_infos[room].values()
-                    }
-                    if (
-                        len(self.transfer_infos[room]) == required_dst_info_num
-                        and len(request_ids) == 1
-                    ):
-                        self.resolve_kv_replica_factor(self.transfer_infos[room])
+                    request_ids = {info.request_id for info in infos.values()}
+                    if len(infos) == required_dst_info_num and len(request_ids) == 1:
+                        self.resolve_kv_replica_factor(infos)
                         self.req_to_decode_prefix_len[room] = next(
                             (
                                 info.decode_prefix_len
-                                for info in self.transfer_infos[room].values()
+                                for info in infos.values()
                                 if info.decode_prefix_len is not None
                             ),
                             0,
@@ -1626,9 +1675,9 @@ class MooncakeKVManager(CommonKVManager):
                     num_pages = int(msg[4].decode("ascii"))
                     session_id = msg[5].decode("ascii")
                     handler = self._staging_handler
-                    assert (
-                        handler is not None
-                    ), "CHUNK_READY received before staging handler initialized"
+                    assert handler is not None, (
+                        "CHUNK_READY received before staging handler initialized"
+                    )
                     handler.handle_chunk_arrived(
                         room,
                         chunk_idx,
@@ -1651,13 +1700,19 @@ class MooncakeKVManager(CommonKVManager):
                     logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
                     continue
 
-                bootstrap_room, status, prefill_rank = msg
+                bootstrap_room, status, prefill_rank, *request_id_frame = msg
                 status = int(status.decode("ascii"))
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
                 prefill_rank = int(prefill_rank.decode("ascii"))
+                request_id = (
+                    request_id_frame[0].decode("utf-8") if request_id_frame else None
+                )
 
-                if status == KVPoll.Success:
-                    if bootstrap_room in self.request_status:
+                with self._get_request_status_lock():
+                    if not self.is_current_generation(bootstrap_room, request_id):
+                        continue
+
+                    if status == KVPoll.Success:
                         self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
                         expected_response_num = (
                             self.required_prefill_response_num_table[bootstrap_room]
@@ -1671,13 +1726,20 @@ class MooncakeKVManager(CommonKVManager):
                                 if handler.is_staging_room(bootstrap_room):
                                     handler.submit_last_scatter_async(bootstrap_room)
                                 self._chunk_writer_counts.pop(bootstrap_room, None)
-                            self.update_status(bootstrap_room, KVPoll.Success)
-                elif status == KVPoll.Failed:
-                    self.record_failure(
-                        bootstrap_room,
-                        "Failed to get kvcache from prefill instance, it might be dead",
-                    )
-                    self.update_status(bootstrap_room, status)
+                            self.update_status(
+                                bootstrap_room,
+                                KVPoll.Success,
+                                request_id=request_id,
+                            )
+                    elif status == KVPoll.Failed:
+                        self.record_failure(
+                            bootstrap_room,
+                            "Failed to get kvcache from prefill instance, it might be dead",
+                            request_id=request_id,
+                        )
+                        self.update_status(
+                            bootstrap_room, status, request_id=request_id
+                        )
 
         threading.Thread(target=decode_thread).start()
         self._start_heartbeat_checker_thread()
@@ -1691,6 +1753,7 @@ class MooncakeKVManager(CommonKVManager):
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        request_id: Optional[str] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -1728,6 +1791,7 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                request_id=request_id,
                 trace_ctx=trace_ctx,
             )
         )
@@ -1781,7 +1845,6 @@ class MooncakeKVManager(CommonKVManager):
 
 
 class MooncakeKVSender(CommonKVSender):
-
     def __init__(
         self,
         mgr: MooncakeKVManager,
@@ -1824,6 +1887,7 @@ class MooncakeKVSender(CommonKVSender):
                 index_slice,
                 False,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                request_id=self.request_id,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -1834,6 +1898,7 @@ class MooncakeKVSender(CommonKVSender):
                 aux_index=self.aux_index,
                 state_indices=state_indices,
                 trace_ctx=self.trace_ctx.copy_for_thread(),
+                request_id=self.request_id,
             )
         self._record_transfer_indices(kv_indices, state_indices)
 
@@ -1967,8 +2032,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
                 f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
+                request_id=self.request_id,
             )
-            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            self.kv_mgr.update_status(
+                self.bootstrap_room,
+                KVPoll.Failed,
+                request_id=self.request_id,
+            )
             return
 
         if (
