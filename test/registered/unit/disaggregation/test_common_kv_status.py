@@ -43,7 +43,6 @@ class TestCommonKVStatus(unittest.TestCase):
         sender.clear()
 
         for late_status in (
-            KVPoll.WaitingForInput,
             KVPoll.Transferring,
             KVPoll.Success,
             KVPoll.Failed,
@@ -52,7 +51,12 @@ class TestCommonKVStatus(unittest.TestCase):
                 manager.update_status(7, late_status)
                 self.assertNotIn(7, manager.request_status)
 
-    def test_dummy_cp_rank_starts_at_bootstrapping(self):
+        manager.is_dummy_cp_rank = False
+        manager.server_args = SimpleNamespace(dp_size=1)
+        CommonKVSender(manager, "127.0.0.1:30000", 7, [], 0)
+        self.assertEqual(manager.request_status[7], KVPoll.Bootstrapping)
+
+    def test_dummy_cp_rank_initializes_waiting(self):
         manager = self._manager()
         manager.is_dummy_cp_rank = True
 
@@ -60,29 +64,15 @@ class TestCommonKVStatus(unittest.TestCase):
 
         self.assertEqual(manager.request_status[7], KVPoll.WaitingForInput)
 
-    def test_sender_applies_metadata_that_arrived_before_bootstrapping(self):
+    def test_metadata_readiness_can_arrive_before_sender(self):
         manager = self._manager()
         manager.is_dummy_cp_rank = False
         manager.server_args = SimpleNamespace(dp_size=1)
-        manager.mark_metadata_ready(7)
-        self.assertNotIn(7, manager.request_status)
+        manager.update_status(7, KVPoll.WaitingForInput)
 
         CommonKVSender(manager, "127.0.0.1:30000", 7, [], 0)
 
         self.assertEqual(manager.request_status[7], KVPoll.WaitingForInput)
-
-    def test_reused_room_does_not_inherit_cleared_metadata_readiness(self):
-        manager = self._manager()
-        manager.is_dummy_cp_rank = False
-        manager.server_args = SimpleNamespace(dp_size=1)
-        manager.mark_metadata_ready(7)
-        sender = CommonKVSender(manager, "127.0.0.1:30000", 7, [], 0)
-
-        sender.clear()
-        manager.mark_metadata_ready(7)
-        CommonKVSender(manager, "127.0.0.1:30000", 7, [], 0)
-
-        self.assertEqual(manager.request_status[7], KVPoll.Bootstrapping)
 
     def test_concurrent_success_cannot_overwrite_failure(self):
         manager = self._manager(KVPoll.WaitingForInput)
