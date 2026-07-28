@@ -1,0 +1,25 @@
+python/sglang/srt/disaggregation/common/staging_handler.py
+  s_96a1d04ebcda02::t_a780ec3a6e8587 91-93,186,188,323,330,421,424-425,427-428,434,436,439-440,442-445,451-453
+python/sglang/srt/disaggregation/mooncake/conn.py
+  s_96a1d04ebcda02::t_2bbdd2fe0ae864 11,363
+python/sglang/srt/disaggregation/utils.py
+  s_96a1d04ebcda02::t_45399a349ad6f3 266
+test/registered/unit/disaggregation/test_transfer_ownership_barrier.py
+  s_96a1d04ebcda02::t_557461c39c08d0 65,1455,1466,1468-1470,1473-1474,1476-1477,1487
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "96dd45055270ecf507b3fb45e1da6a907b942cb5",
+  "prompts": {},
+  "sessions": {
+    "s_96a1d04ebcda02": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fa9a4-56d8-7ad0-9c4a-c5634890b2b5",
+        "model": "unknown"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    }
+  }
+}
