@@ -1,0 +1,66 @@
+python/sglang/srt/disaggregation/base/conn.py
+  s_a2952ac4a4018a::t_ee5d68ab1cf820 88-97
+  s_a2952ac4a4018a::t_a0530ce58ba480 191-221,281-293
+python/sglang/srt/disaggregation/common/conn.py
+  s_a2952ac4a4018a::t_1fb75ef06b5138 205,730,733-749
+python/sglang/srt/disaggregation/mooncake/conn.py
+  s_a2952ac4a4018a::t_5fcbcb31caff64 5,8,12-13,3018-3019
+  s_a2952ac4a4018a::t_0df542db0da315 20-25,46,58,79-236,251-253,282,352-359,365-371,434-437,445-853,984-986,995,1306-1312,1448-1456,1516-1518,1526,1918-1920,1925,1944,1954-1957,1959-1960,2185-2187,2214,2231,2235-2299,2311-2312,2316-2322,2332,2339-2340,2346,2354-2356,2405-2416,2441,2515-2525,2575-2620,2654-2656,2670-2681,2683-2695,2801-2804,2824,2851-3017
+python/sglang/srt/disaggregation/common/staging_handler.py
+  s_a2952ac4a4018a::t_51571f06091033 18
+  s_a2952ac4a4018a::t_49d7bbfd128862 91-95,428-441,445-455,458-460,465,468-471
+test/registered/unit/disaggregation/test_transfer_ownership_barrier.py
+  s_a2952ac4a4018a::t_a17817c5da7ee4 24-1392,1396,1401-1402,1404-1407,1409,1412-1413,1416,1420-1422,1427,1433,1436-1439,1441-1442,1449,1454,1459,1462,1464-1465,1468,1477-1478,1485-1486,1496,1507-1508,1510,1518,1536,1544,1551,1564
+  s_a2952ac4a4018a::t_b5a0c533d68fc4 1-23,1393-1395,1397-1400,1403,1408,1410-1411,1414-1415,1417-1419,1423-1426,1428-1432,1434-1435,1440,1443-1448,1450-1453,1455-1458,1460-1461,1463,1466-1467,1469-1476,1479-1484,1487-1495,1497-1506,1509,1511-1517,1519-1535,1537-1543,1545-1550,1552-1563,1565-1608
+python/sglang/srt/disaggregation/common/utils.py
+  s_a2952ac4a4018a::t_aae1709e2ab841 1,7,135-192
+  s_a2952ac4a4018a::t_8e061a25f5ffc1 29-32
+python/sglang/srt/disaggregation/decode.py
+  s_a2952ac4a4018a::t_19f5b5d6d23830 752-755
+  s_a2952ac4a4018a::t_881dda1e7ed657 1944-1958
+python/sglang/srt/disaggregation/decode_hicache_mixin.py
+  s_a2952ac4a4018a::t_6e0d46b9aa09bb 169-176
+python/sglang/srt/environ.py
+  s_a2952ac4a4018a::t_cd283e8b358e1e 213-229,416-427
+python/sglang/srt/disaggregation/prefill.py
+  s_a2952ac4a4018a::t_82c927a8735788 430-433,993-995
+python/sglang/srt/disaggregation/ascend/conn.py
+  s_a2952ac4a4018a::t_a3ad2a1fb492f5 11-14,192-198
+python/sglang/srt/disaggregation/utils.py
+  s_a2952ac4a4018a::t_6f78117062255a 3,265-268
+  s_a2952ac4a4018a::t_f2040d8fe60d27 17,21-22,106,110-118,146-203,221-222,230,232-235,246
+python/sglang/srt/managers/scheduler.py
+  s_a2952ac4a4018a::t_3fff3c759fcd37 2710-2724
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0cea41f390e456d32142cfe1c0efe32304fc4862",
+  "prompts": {},
+  "sessions": {
+    "s_1787a638fb71e0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fa6c1-3964-71f0-b109-67e1ea3ce383",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Kastan Day <kastan@cloudflare.com>"
+    },
+    "s_220a31974188fc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fa6c4-e2b1-7ec0-8236-3c827dbfbebe",
+        "model": "unknown"
+      },
+      "human_author": "Kastan Day <kastan@cloudflare.com>"
+    },
+    "s_a2952ac4a4018a": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_06a7403aaffewJTacNzWhtB3Or",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Kastan Day <kastan@cloudflare.com>"
+    }
+  }
+}
