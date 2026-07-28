@@ -200,6 +200,9 @@ class AscendKVManager(MooncakeKVManager):
                 if status != 0:
                     for f in futures:
                         f.cancel()
+                    # cancel() can't stop a running future; drain before
+                    # reporting failure.
+                    concurrent.futures.wait(futures)
                     return status
         else:
             # Combining all layers' params in one batch transfer is more efficient

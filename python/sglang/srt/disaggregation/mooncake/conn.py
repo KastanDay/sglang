@@ -721,6 +721,12 @@ class MooncakeKVManager(CommonKVManager):
                 if status != 0:
                     for f in futures:
                         f.cancel()
+                    # cancel() is a no-op for a future that is already running,
+                    # so wait for the stragglers: returning early lets the
+                    # caller report failure -- and the scheduler free this
+                    # request's KV pages -- while sibling transfers are still
+                    # reading and writing them.
+                    concurrent.futures.wait(futures)
                     return status
             return 0
         else:
@@ -873,6 +879,9 @@ class MooncakeKVManager(CommonKVManager):
             if status != 0:
                 for f in futures:
                     f.cancel()
+                # cancel() can't stop a running future; drain before reporting
+                # failure.
+                concurrent.futures.wait(futures)
                 return status
 
         return 0
