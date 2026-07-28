@@ -177,8 +177,6 @@ class CommonKVManager(BaseKVManager):
 
         self.request_status: Dict[int, KVPoll] = {}
         self._request_status_lock = threading.RLock()
-        self._metadata_ready_rooms: Set[int] = set()
-        self._cleared_room_tombstones: Set[int] = set()
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_lock = threading.Lock()
@@ -262,16 +260,15 @@ class CommonKVManager(BaseKVManager):
     def update_status(self, bootstrap_room: int, status: KVPoll):
         with self._get_request_status_lock():
             if bootstrap_room not in self.request_status:
-                # Only the synchronous room-initialization transition may
-                # create an entry. All later transitions can arrive from
-                # background workers, so accepting one after clear() would
-                # resurrect the old generation and could make an exact
-                # bootstrap_room reuse inherit stale state.
-                if status != KVPoll.Bootstrapping:
+                # Bootstrapping and WaitingForInput are the two initialization
+                # handshakes and may race each other across prefill/decode.
+                # Transfer progress, completion, and failure callbacks must
+                # never recreate a room after clear().
+                if status not in (
+                    KVPoll.Bootstrapping,
+                    KVPoll.WaitingForInput,
+                ):
                     return
-                getattr(self, "_cleared_room_tombstones", set()).discard(
-                    bootstrap_room
-                )
                 self.request_status[bootstrap_room] = status
             else:
                 # Failure is terminal for the current room generation. The
@@ -290,32 +287,6 @@ class CommonKVManager(BaseKVManager):
     def clear_status(self, bootstrap_room: int) -> None:
         with self._get_request_status_lock():
             self.request_status.pop(bootstrap_room, None)
-            getattr(self, "_metadata_ready_rooms", set()).discard(bootstrap_room)
-            tombstones = getattr(self, "_cleared_room_tombstones", None)
-            if tombstones is None:
-                tombstones = set()
-                self._cleared_room_tombstones = tombstones
-            tombstones.add(bootstrap_room)
-
-    def mark_metadata_ready(self, bootstrap_room: int) -> None:
-        """Record completed destination metadata and advance an existing room."""
-        with self._get_request_status_lock():
-            if bootstrap_room in getattr(
-                self, "_cleared_room_tombstones", set()
-            ):
-                return
-            ready_rooms = getattr(self, "_metadata_ready_rooms", None)
-            if ready_rooms is None:
-                ready_rooms = set()
-                self._metadata_ready_rooms = ready_rooms
-            ready_rooms.add(bootstrap_room)
-            self.update_status(bootstrap_room, KVPoll.WaitingForInput)
-
-    def _mark_room_ready_if_metadata_complete(self, bootstrap_room: int) -> None:
-        """Apply destination metadata that arrived before sender creation."""
-        with self._get_request_status_lock():
-            if bootstrap_room in getattr(self, "_metadata_ready_rooms", set()):
-                self.update_status(bootstrap_room, KVPoll.WaitingForInput)
 
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
@@ -1051,12 +1022,10 @@ class CommonKVSender(BaseKVSender):
         self.init_time: Optional[float] = None
         if self.kv_mgr.is_dummy_cp_rank:
             # Non-authoritative CP ranks are dummy participants.
-            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
             return
 
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
-        self.kv_mgr._mark_room_ready_if_metadata_complete(self.bootstrap_room)
         if self.kv_mgr.server_args.dp_size > 1 and not req_has_disagg_prefill_dp_rank:
             if self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room":
                 self._register_prefill_dp_rank()
@@ -1197,7 +1166,11 @@ class CommonKVSender(BaseKVSender):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
-        self.kv_mgr.clear_status(self.bootstrap_room)
+        clear_status = getattr(self.kv_mgr, "clear_status", None)
+        if clear_status is not None:
+            clear_status(self.bootstrap_room)
+        else:
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "transfer_infos"):
@@ -1444,7 +1417,11 @@ class CommonKVReceiver(BaseKVReceiver):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
-        self.kv_mgr.clear_status(self.bootstrap_room)
+        clear_status = getattr(self.kv_mgr, "clear_status", None)
+        if clear_status is not None:
+            clear_status(self.bootstrap_room)
+        else:
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
 

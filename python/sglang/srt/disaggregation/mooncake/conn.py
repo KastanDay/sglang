@@ -1595,7 +1595,7 @@ class MooncakeKVManager(CommonKVManager):
                             ),
                             0,
                         )
-                        self.mark_metadata_ready(room)
+                        self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread).start()
 
