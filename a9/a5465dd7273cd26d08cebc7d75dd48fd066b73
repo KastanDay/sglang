@@ -1,0 +1,21 @@
+python/sglang/srt/disaggregation/mooncake/conn.py
+  s_220a31974188fc::t_6f5acc1b2c3585 2842-2872,2996-3008
+test/registered/unit/disaggregation/test_transfer_ownership_barrier.py
+  s_220a31974188fc::t_a127aefe7c57af 121,135-141,991-1026
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a9a5465dd7273cd26d08cebc7d75dd48fd066b73",
+  "prompts": {},
+  "sessions": {
+    "s_220a31974188fc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fa6c4-e2b1-7ec0-8236-3c827dbfbebe",
+        "model": "unknown"
+      },
+      "human_author": "Kastan Day <kastan@cloudflare.com>"
+    }
+  }
+}
