@@ -1,0 +1,23 @@
+python/sglang/srt/disaggregation/common/conn.py
+  s_220a31974188fc::t_ea364185b54f05 746-753
+python/sglang/srt/disaggregation/mooncake/conn.py
+  s_220a31974188fc::t_a537cc32a91af5 453-466,2281-2307
+python/sglang/srt/disaggregation/prefill.py
+  s_220a31974188fc::t_57f08a3ed4a9b7 978-981
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0c28d2799260621d047f68a0643a4c114c3f07d3",
+  "prompts": {},
+  "sessions": {
+    "s_220a31974188fc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fa6c4-e2b1-7ec0-8236-3c827dbfbebe",
+        "model": "unknown"
+      },
+      "human_author": "Kastan Day <kastan@cloudflare.com>"
+    }
+  }
+}
