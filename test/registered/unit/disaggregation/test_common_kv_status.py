@@ -186,6 +186,20 @@ class TestCommonKVStatus(unittest.TestCase):
         manager.update_status(7, KVPoll.Success)
         self.assertEqual(manager.request_status[7], KVPoll.Success)
 
+    def test_legacy_abort_can_negotiate_only_during_bootstrap(self):
+        manager = self._manager()
+        manager.start_generation(7, "current")
+
+        self.assertTrue(manager.is_current_generation_or_legacy_bootstrap(7, None))
+        self.assertIsNone(manager.wire_request_id(7, "current"))
+
+        manager.clear_status(7, "current")
+        manager.start_generation(7, "new")
+        manager.update_status(7, KVPoll.WaitingForInput, request_id="new")
+
+        self.assertFalse(manager.is_current_generation_or_legacy_bootstrap(7, None))
+        self.assertEqual(manager.wire_request_id(7, "new"), "new")
+
     def test_legacy_transfer_info_negotiates_active_generation(self):
         manager = self._manager()
         manager.transfer_infos = {}

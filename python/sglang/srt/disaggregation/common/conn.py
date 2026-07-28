@@ -475,6 +475,21 @@ class CommonKVManager(BaseKVManager):
                 and self._request_id_matches_active(bootstrap_room, request_id)
             )
 
+    def is_current_generation_or_legacy_bootstrap(
+        self, bootstrap_room: int, request_id: Optional[str]
+    ) -> bool:
+        """Negotiate an old peer when its first room message is an abort."""
+        with self._get_request_status_lock():
+            if self.is_current_generation(bootstrap_room, request_id):
+                return True
+            if (
+                not self._normalize_request_id(request_id)
+                and self.request_status.get(bootstrap_room) == KVPoll.Bootstrapping
+            ):
+                self.allow_legacy_generation(bootstrap_room)
+                return True
+            return False
+
     def store_transfer_info(
         self,
         bootstrap_room: int,

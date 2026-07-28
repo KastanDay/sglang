@@ -1590,7 +1590,9 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     # No need to abort the room if it has already succeeded
                     if (
-                        self.is_current_generation(room_to_be_aborted, request_id)
+                        self.is_current_generation_or_legacy_bootstrap(
+                            room_to_be_aborted, request_id
+                        )
                         and self.check_status(room_to_be_aborted) != KVPoll.Success
                     ):
                         self.update_status(

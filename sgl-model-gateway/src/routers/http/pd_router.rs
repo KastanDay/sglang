@@ -211,12 +211,10 @@ impl PDRouter {
         None
     }
 
-    fn get_chat_batch_size(req: &ChatCompletionRequest) -> Option<usize> {
-        if let Some(n) = req.n {
-            if n > 1 {
-                return Some(n as usize);
-            }
-        }
+    fn get_chat_batch_size(_req: &ChatCompletionRequest) -> Option<usize> {
+        // `n` expands samples for one base prompt inside TokenizerManager; it
+        // is not an input batch and therefore still needs scalar bootstrap
+        // fields and a scalar RID.
         None
     }
 
@@ -1800,6 +1798,33 @@ mod tests {
             PDRouter::build_chat_request_text(&body).is_none(),
             "empty conversation text should produce None, not Some(\"\")"
         );
+    }
+
+    #[test]
+    fn test_chat_parallel_sampling_is_not_treated_as_an_input_batch() {
+        let body: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "n": 3
+        }))
+        .expect("valid chat request");
+        let worker = create_test_worker(
+            "http://prefill:30000".to_string(),
+            WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            },
+            true,
+        );
+
+        let injected = PDRouter::inject_bootstrap_into_value(
+            serde_json::to_value(&body).expect("serializable chat request"),
+            worker.as_ref(),
+            PDRouter::get_chat_batch_size(&body),
+        )
+        .expect("bootstrap fields should be injected");
+
+        assert!(injected["bootstrap_room"].is_number());
+        assert!(injected["rid"].is_string());
     }
 
     #[tokio::test]

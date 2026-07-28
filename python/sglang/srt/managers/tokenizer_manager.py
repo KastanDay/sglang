@@ -155,17 +155,27 @@ def _parallel_sample_request_id(base_rid: str, sample_index: Optional[int]) -> s
 
 
 def _parallel_sample_bootstrap_room(
-    base_room: Optional[int], base_rid: str, sample_index: int
+    base_room: Optional[int],
+    base_rid: str,
+    sample_index: int,
+    dp_size: int = 1,
 ) -> Optional[int]:
     """Give every parallel sample a stable room distinct from the prefix-cache room."""
     if base_room is None:
         return None
+    dp_size = max(int(dp_size), 1)
     digest = hashlib.blake2b(
         f"{base_room}:{base_rid}:{sample_index}".encode("utf-8"),
         digest_size=8,
         person=b"sglang-pd",
     ).digest()
-    return int.from_bytes(digest, "big") & ((1 << 63) - 1)
+    affinity = base_room % dp_size
+    num_affine_rooms = ((1 << 63) - 1 - affinity) // dp_size + 1
+    slot = int.from_bytes(digest, "big") % num_affine_rooms
+    room = affinity + slot * dp_size
+    if room == base_room:
+        room = affinity + ((slot + 1) % num_affine_rooms) * dp_size
+    return room
 
 
 @lru_cache(maxsize=1)
@@ -1698,7 +1708,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tmp_obj.rid = sample_rid
                     tokenized_obj.rid = sample_rid
                     sample_room = _parallel_sample_bootstrap_room(
-                        objs[i].bootstrap_room, objs[i].rid, sample_index
+                        objs[i].bootstrap_room,
+                        objs[i].rid,
+                        sample_index,
+                        getattr(self.server_args, "dp_size", 1),
                     )
                     tmp_obj.bootstrap_room = sample_room
                     tokenized_obj.bootstrap_room = sample_room

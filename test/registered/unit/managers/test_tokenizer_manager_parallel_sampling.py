@@ -31,15 +31,16 @@ class TestParallelSampleRequestId(unittest.TestCase):
 
     def test_rooms_are_stable_and_do_not_reuse_prefix_cache_room(self):
         first_worker = [
-            _parallel_sample_bootstrap_room(7, "shared", i) for i in range(3)
+            _parallel_sample_bootstrap_room(7, "shared", i, dp_size=4) for i in range(3)
         ]
         second_worker = [
-            _parallel_sample_bootstrap_room(7, "shared", i) for i in range(3)
+            _parallel_sample_bootstrap_room(7, "shared", i, dp_size=4) for i in range(3)
         ]
 
         self.assertEqual(first_worker, second_worker)
         self.assertEqual(len(set(first_worker)), len(first_worker))
         self.assertNotIn(7, first_worker)
+        self.assertTrue(all(room % 4 == 7 % 4 for room in first_worker))
         self.assertIsNone(_parallel_sample_bootstrap_room(None, "shared", 0))
 
 
