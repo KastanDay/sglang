@@ -377,21 +377,21 @@ class MooncakeKVManager(CommonKVManager):
         """Notify decode that a non-last staging chunk RDMA is complete."""
         try:
             na = NetworkAddress(req.endpoint, req.dst_port)
+            payload = [
+                b"CHUNK_READY",
+                str(req.room).encode("ascii"),
+                str(chunk_idx).encode("ascii"),
+                str(kv_chunk.index_slice.start).encode("ascii"),
+                str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
+                req.mooncake_session_id.encode("ascii"),
+                str(prefill_unique_rank).encode("ascii"),
+            ]
+            if kv_chunk.request_id is not None:
+                payload.append(kv_chunk.request_id.encode("utf-8"))
             self._connect(
                 na.to_tcp(),
                 is_ipv6=na.is_ipv6,
-            ).send_multipart(
-                [
-                    b"CHUNK_READY",
-                    str(req.room).encode("ascii"),
-                    str(chunk_idx).encode("ascii"),
-                    str(kv_chunk.index_slice.start).encode("ascii"),
-                    str(len(kv_chunk.prefill_kv_indices)).encode("ascii"),
-                    req.mooncake_session_id.encode("ascii"),
-                    str(prefill_unique_rank).encode("ascii"),
-                    (kv_chunk.request_id or "").encode("utf-8"),
-                ]
-            )
+            ).send_multipart(payload)
         except Exception:
             pass
 
@@ -1267,14 +1267,14 @@ class MooncakeKVManager(CommonKVManager):
         request_id: Optional[str] = None,
     ):
         na = NetworkAddress(remote, dst_port)
-        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
-            [
-                str(room).encode("ascii"),
-                str(status).encode("ascii"),
-                str(prefill_rank).encode("ascii"),
-                (request_id or "").encode("utf-8"),
-            ]
-        )
+        payload = [
+            str(room).encode("ascii"),
+            str(status).encode("ascii"),
+            str(prefill_rank).encode("ascii"),
+        ]
+        if request_id is not None:
+            payload.append(request_id.encode("utf-8"))
+        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(payload)
 
     def transfer_worker(
         self,
@@ -1808,7 +1808,7 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
-                request_id=request_id,
+                request_id=self.wire_request_id(bootstrap_room, request_id),
                 trace_ctx=trace_ctx,
             )
         )

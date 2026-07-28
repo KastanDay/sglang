@@ -3,7 +3,11 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVSender
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVManager,
+    CommonKVSender,
+    PrefillRankInfo,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -170,6 +174,60 @@ class TestCommonKVStatus(unittest.TestCase):
 
         self.assertIsNone(result)
         self.assertEqual(manager.transfer_infos[7], {"first-peer": first_info})
+
+    def test_legacy_status_requires_generation_negotiation(self):
+        manager = self._manager()
+        manager.start_generation(7, "current")
+
+        manager.update_status(7, KVPoll.Success)
+        self.assertEqual(manager.request_status[7], KVPoll.Bootstrapping)
+
+        manager.allow_legacy_generation(7)
+        manager.update_status(7, KVPoll.Success)
+        self.assertEqual(manager.request_status[7], KVPoll.Success)
+
+    def test_legacy_transfer_info_negotiates_active_generation(self):
+        manager = self._manager()
+        manager.transfer_infos = {}
+        manager.start_generation(7, "current")
+        info = SimpleNamespace(decode_prefix_len=3, request_id=None)
+
+        infos = manager.store_transfer_info(7, None, "legacy-peer", info)
+        manager.mark_metadata_ready(7, None)
+
+        self.assertEqual(infos, {"legacy-peer": info})
+        self.assertIsNone(info.request_id)
+        self.assertEqual(manager.request_status[7], KVPoll.WaitingForInput)
+
+    def test_early_legacy_transfer_info_is_adopted_by_new_sender(self):
+        manager = self._manager()
+        manager.transfer_infos = {}
+        info = SimpleNamespace(decode_prefix_len=3, request_id=None)
+        manager.store_transfer_info(7, None, "legacy-peer", info)
+
+        manager.start_generation(7, "current")
+
+        self.assertEqual(manager.transfer_infos[7], {"legacy-peer": info})
+        self.assertIsNone(info.request_id)
+        self.assertTrue(manager.is_current_generation(7, None))
+
+    def test_new_generation_does_not_inherit_legacy_fallback(self):
+        manager = self._manager()
+        manager.start_generation(7, "old")
+        manager.allow_legacy_generation(7)
+        self.assertIsNone(manager.wire_request_id(7, "old"))
+        manager.clear_status(7, "old")
+        manager.start_generation(7, "new")
+
+        self.assertEqual(manager.wire_request_id(7, "new"), "new")
+        manager.update_status(7, KVPoll.Success)
+
+        self.assertEqual(manager.request_status[7], KVPoll.Bootstrapping)
+
+    def test_rank_bootstrap_advertises_generation_capability(self):
+        info = PrefillRankInfo(rank_ip="127.0.0.1", rank_port=30000)
+
+        self.assertTrue(info.generation_ids_supported)
 
     def test_concurrent_success_cannot_overwrite_failure(self):
         manager = self._manager(KVPoll.WaitingForInput)
