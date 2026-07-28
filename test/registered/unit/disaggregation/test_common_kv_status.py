@@ -1,4 +1,6 @@
+import threading
 import unittest
+from types import SimpleNamespace
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVSender
@@ -27,7 +29,7 @@ class TestCommonKVStatus(unittest.TestCase):
     def test_cleared_room_can_start_a_new_generation(self):
         manager = self._manager(KVPoll.Failed)
 
-        manager.request_status.pop(7)
+        manager.clear_status(7)
         manager.update_status(7, KVPoll.Bootstrapping)
         manager.update_status(7, KVPoll.Success)
 
@@ -57,6 +59,47 @@ class TestCommonKVStatus(unittest.TestCase):
         CommonKVSender(manager, "127.0.0.1:30000", 7, [], 0)
 
         self.assertEqual(manager.request_status[7], KVPoll.WaitingForInput)
+
+    def test_sender_applies_metadata_that_arrived_before_bootstrapping(self):
+        manager = self._manager()
+        manager.is_dummy_cp_rank = False
+        manager.server_args = SimpleNamespace(dp_size=1)
+        manager.mark_metadata_ready(7)
+        self.assertNotIn(7, manager.request_status)
+
+        CommonKVSender(manager, "127.0.0.1:30000", 7, [], 0)
+
+        self.assertEqual(manager.request_status[7], KVPoll.WaitingForInput)
+
+    def test_reused_room_does_not_inherit_cleared_metadata_readiness(self):
+        manager = self._manager()
+        manager.is_dummy_cp_rank = False
+        manager.server_args = SimpleNamespace(dp_size=1)
+        manager.mark_metadata_ready(7)
+        sender = CommonKVSender(manager, "127.0.0.1:30000", 7, [], 0)
+
+        sender.clear()
+        CommonKVSender(manager, "127.0.0.1:30000", 7, [], 0)
+
+        self.assertEqual(manager.request_status[7], KVPoll.Bootstrapping)
+
+    def test_concurrent_success_cannot_overwrite_failure(self):
+        manager = self._manager(KVPoll.WaitingForInput)
+        success_started = threading.Event()
+
+        def report_success():
+            success_started.set()
+            manager.update_status(7, KVPoll.Success)
+
+        with manager._get_request_status_lock():
+            thread = threading.Thread(target=report_success)
+            thread.start()
+            self.assertTrue(success_started.wait(timeout=1))
+            manager.update_status(7, KVPoll.Failed)
+
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(manager.request_status[7], KVPoll.Failed)
 
 
 if __name__ == "__main__":
