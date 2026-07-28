@@ -1,0 +1,23 @@
+python/sglang/srt/disaggregation/mooncake/conn.py
+  s_1787a638fb71e0::t_f8fc161c3e4bd2 174,176-178,481-483,487,493,498-500,2679-2684,2687-2694,2696-2698,2700-2712,2799-2803,2880-2885,3052-3058
+python/sglang/srt/disaggregation/utils.py
+  s_1787a638fb71e0::t_30dccac15b4a98 188-212,214-215
+test/registered/unit/disaggregation/test_transfer_ownership_barrier.py
+  s_1787a638fb71e0::t_5dd5f1a4ed657e 550,554,1159-1184,1188,1247,1255-1266,1318-1340
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2a9e54581d20d3d56fb40fac4a4ccea3428034c6",
+  "prompts": {},
+  "sessions": {
+    "s_1787a638fb71e0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fa6c1-3964-71f0-b109-67e1ea3ce383",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Kastan Day <kastan@cloudflare.com>"
+    }
+  }
+}
