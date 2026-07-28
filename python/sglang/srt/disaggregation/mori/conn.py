@@ -504,43 +504,57 @@ class MoriKVManager(CommonKVManager):
                     return
                 infos = self.transfer_infos.setdefault(transfer_info.room, {})
                 infos[transfer_info.engine_key] = transfer_info
-
-                if len(infos) >= transfer_info.required_dst_info_num:
-                    self.resolve_kv_replica_factor(infos)
-                    # All decode peers reported their dst metadata; pick a
-                    # non-None decode_prefix_len if any peer set it (they
-                    # should all agree, but be defensive). 0 means "no
-                    # prefix hit", which is the same as "feature off".
-                    chosen_prefix_len = next(
-                        (
-                            info.decode_prefix_len
-                            for info in infos.values()
-                            if info.decode_prefix_len is not None
-                        ),
-                        0,
-                    )
-                    self.req_to_decode_prefix_len[transfer_info.room] = (
-                        chosen_prefix_len
-                    )
-                    if chosen_prefix_len > 0:
-                        # Surface incremental KV transfer at INFO so it's
-                        # visible without bumping the global log level.
-                        logger.info(
-                            "MoriKV incremental: room=%s prefix_len=%s peers=%s",
-                            transfer_info.room,
-                            chosen_prefix_len,
-                            len(infos),
-                        )
-                    else:
-                        logger.debug(
-                            "Bootstrap room %s got enough transfer info (%s), "
-                            "decode_prefix_len=0",
-                            transfer_info.room,
-                            len(infos),
-                        )
-                    self.update_status(transfer_info.room, KVPoll.WaitingForInput)
+                self._mark_room_ready_if_metadata_complete(transfer_info.room)
         except Exception:
             logger.exception("Failed to parse transfer info message")
+
+    def _mark_room_ready_if_metadata_complete(self, bootstrap_room: int) -> None:
+        """Advance a bootstrapped room once all early metadata has arrived.
+
+        Callers hold transfer_lock so metadata arrival and sender construction
+        cannot miss each other.
+        """
+        if self.request_status.get(bootstrap_room) != KVPoll.Bootstrapping:
+            return
+
+        infos = self.transfer_infos.get(bootstrap_room)
+        if not infos:
+            return
+        required_dst_info_num = next(iter(infos.values())).required_dst_info_num
+        if len(infos) < required_dst_info_num:
+            return
+
+        self.resolve_kv_replica_factor(infos)
+        # All decode peers reported their dst metadata; pick a non-None
+        # decode_prefix_len if any peer set it (they should all agree, but be
+        # defensive). 0 means "no prefix hit", which is the same as "feature
+        # off".
+        chosen_prefix_len = next(
+            (
+                info.decode_prefix_len
+                for info in infos.values()
+                if info.decode_prefix_len is not None
+            ),
+            0,
+        )
+        self.req_to_decode_prefix_len[bootstrap_room] = chosen_prefix_len
+        if chosen_prefix_len > 0:
+            # Surface incremental KV transfer at INFO so it's visible without
+            # bumping the global log level.
+            logger.info(
+                "MoriKV incremental: room=%s prefix_len=%s peers=%s",
+                bootstrap_room,
+                chosen_prefix_len,
+                len(infos),
+            )
+        else:
+            logger.debug(
+                "Bootstrap room %s got enough transfer info (%s), "
+                "decode_prefix_len=0",
+                bootstrap_room,
+                len(infos),
+            )
+        self.update_status(bootstrap_room, KVPoll.WaitingForInput)
 
     def _validate_message(self, msg: List[bytes]) -> Optional[List[bytes]]:
         if not msg or msg[0] != MORI_GUARD:
@@ -1403,6 +1417,8 @@ class MoriKVSender(CommonKVSender):
             pp_rank,
             req_has_disagg_prefill_dp_rank,
         )
+        with self.kv_mgr.transfer_lock:
+            self.kv_mgr._mark_room_ready_if_metadata_complete(self.bootstrap_room)
         self.transfer_statuses: List[TransferStatus] = []
         self.pending_infos: Optional[List[TransferInfo]] = None
         self.conclude_state: Optional[KVPoll] = None
