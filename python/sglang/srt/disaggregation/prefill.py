@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import time
 from array import array
 from collections import deque
 from http import HTTPStatus
@@ -77,12 +76,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
-
-# Backstop for deferred KV releases (see maybe_defer_kv_release): the transfer
-# engine's synchronous calls carry their own timeouts, so a chunk normally
-# drains in well under this. Past it, release anyway rather than pin the pages
-# on a wedged transfer forever.
-KV_RELEASE_DRAIN_TIMEOUT_S = 30.0
 
 
 def should_force_retry(req: Req) -> bool:
@@ -805,40 +798,35 @@ class SchedulerDisaggregationPrefillMixin:
     def maybe_defer_kv_release(
         self: Scheduler, req: Req, is_insert: bool = True
     ) -> None:
-        """Free the request's KV pages, unless a transfer worker is still
-        sending from them.
+        """Free the request's transfer buffers once its worker has drained.
 
         A request can be observed as failed (an abort from the decode side, or
         a failure propagated from another rank) while a transfer worker on this
         rank is mid-send for it. Freeing the pages then lets the next request
         be allocated pages an in-flight transfer is still reading, so it would
         silently send that request's KV to the failed request's decode
-        destination. Park the release until the worker drains (bounded).
+        destination. The metadata row is also a transfer source for the last
+        chunk, so keep it pinned with the KV pages.
         """
         if req.disagg_kv_sender.has_inflight_transfers():
-            self.disagg_prefill_pending_kv_releases.append(
-                (req, is_insert, time.monotonic() + KV_RELEASE_DRAIN_TIMEOUT_S)
-            )
+            self.disagg_prefill_pending_kv_releases.append((req, is_insert))
             return
         release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
 
     def process_pending_kv_releases(self: Scheduler) -> None:
-        """Free parked KV pages whose transfers have drained (or timed out)."""
+        """Free parked KV pages and metadata rows whose transfers have drained."""
         if not self.disagg_prefill_pending_kv_releases:
             return
-        now = time.monotonic()
         still_pending = []
-        for req, is_insert, deadline in self.disagg_prefill_pending_kv_releases:
+        for req, is_insert in self.disagg_prefill_pending_kv_releases:
             if req.disagg_kv_sender.has_inflight_transfers():
-                if now < deadline:
-                    still_pending.append((req, is_insert, deadline))
-                    continue
-                logger.error(
-                    f"Releasing KV pages of {req.rid=} while a transfer may "
-                    "still be sending them: the transfer did not drain within "
-                    f"{KV_RELEASE_DRAIN_TIMEOUT_S:.0f}s."
-                )
+                still_pending.append((req, is_insert))
+                continue
             release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+            maybe_release_metadata_buffer(
+                req, self.req_to_metadata_buffer_idx_allocator
+            )
         self.disagg_prefill_pending_kv_releases = still_pending
 
     def process_disagg_prefill_inflight_queue(
@@ -939,12 +927,13 @@ class SchedulerDisaggregationPrefillMixin:
             None,
         )
         for req in done_reqs:
-            req: Req
-
-            maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
-            )
-
+            if not any(
+                pending_req is req
+                for pending_req, _ in self.disagg_prefill_pending_kv_releases
+            ):
+                maybe_release_metadata_buffer(
+                    req, self.req_to_metadata_buffer_idx_allocator
+                )
         self.disagg_prefill_inflight_queue = undone_reqs
 
         return done_reqs

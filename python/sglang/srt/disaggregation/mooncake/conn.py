@@ -191,7 +191,7 @@ class MooncakeKVManager(CommonKVManager):
             # room -> number of chunks a transfer worker is currently sending.
             # The scheduler must not free a failed request's KV pages while a
             # chunk is mid-send (see MooncakeKVSender.has_inflight_transfers).
-            self._inflight_chunk_counts: Dict[int, int] = {}
+            self._inflight_chunk_counts: dict[int, int] = {}
             self._inflight_chunk_lock = threading.Lock()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()

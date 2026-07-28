@@ -1,19 +1,17 @@
-"""Prefill must not free KV pages while a transfer worker is still sending them.
+"""Prefill must not free transfer buffers while a worker is still sending them.
 
 A request can be observed as failed -- an abort notification from the decode
 side, or a failure propagated from another rank through poll_and_all_reduce --
 while a transfer worker on this rank is mid-send for it. On the unfixed code
-the scheduler freed the request's KV pages immediately; a request allocated
-the same pages next had its KV silently read by the in-flight transfer and
-sent to the failed request's decode destination.
+the scheduler freed the request's KV pages and metadata row immediately; a
+request allocated the same storage next had its contents silently read by the
+in-flight transfer and sent to the failed request's decode destination.
 
 The fix counts chunks a worker is executing per room, and the scheduler parks
-the release of a failed request's pages until that count drains (bounded by
-KV_RELEASE_DRAIN_TIMEOUT_S).
+the release of a failed request's pages until that count drains.
 """
 
 import threading
-import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -27,6 +25,9 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVSender,
 )
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -95,6 +96,14 @@ class TestWorkerChunksAreCounted(CustomTestCase):
         mgr.is_hybrid_mla_backend = False
         mgr.send_kvcache = blocking_send
         sender = make_sender(mgr)
+        worker_drained = threading.Event()
+        end_inflight_chunk = mgr._end_inflight_chunk
+
+        def record_worker_drain(room):
+            end_inflight_chunk(room)
+            worker_drained.set()
+
+        mgr._end_inflight_chunk = record_worker_drain
 
         queue = FastQueue()
         worker = threading.Thread(
@@ -126,9 +135,7 @@ class TestWorkerChunksAreCounted(CustomTestCase):
         self.assertTrue(sender.has_inflight_transfers())
 
         release_send.set()
-        deadline = time.monotonic() + 5
-        while sender.has_inflight_transfers() and time.monotonic() < deadline:
-            time.sleep(0.01)
+        self.assertTrue(worker_drained.wait(5))
         self.assertFalse(
             sender.has_inflight_transfers(),
             "the counter must drain once the send returns",
@@ -139,6 +146,7 @@ class TestSchedulerDefersRelease(CustomTestCase):
     def _scheduler_stub(self):
         stub = SimpleNamespace(
             tree_cache=MagicMock(),
+            req_to_metadata_buffer_idx_allocator=MagicMock(),
             disagg_prefill_pending_kv_releases=[],
         )
         stub.maybe_defer_kv_release = (
@@ -154,6 +162,7 @@ class TestSchedulerDefersRelease(CustomTestCase):
     def _req(self, inflight: bool):
         return SimpleNamespace(
             rid="r1",
+            metadata_buffer_index=3,
             disagg_kv_sender=SimpleNamespace(has_inflight_transfers=lambda: inflight),
         )
 
@@ -163,16 +172,20 @@ class TestSchedulerDefersRelease(CustomTestCase):
         with patch("sglang.srt.disaggregation.prefill.release_kv_cache") as release:
             stub.maybe_defer_kv_release(req, is_insert=False)
             release.assert_not_called()
+            stub.req_to_metadata_buffer_idx_allocator.free.assert_not_called()
             self.assertEqual(len(stub.disagg_prefill_pending_kv_releases), 1)
 
             # Still draining: the sweep must keep it parked.
             stub.process_pending_kv_releases()
             release.assert_not_called()
+            stub.req_to_metadata_buffer_idx_allocator.free.assert_not_called()
 
-            # Drained: the sweep releases it with the original is_insert.
+            # Drained: the sweep releases KV and metadata together.
             req.disagg_kv_sender.has_inflight_transfers = lambda: False
             stub.process_pending_kv_releases()
             release.assert_called_once_with(req, stub.tree_cache, is_insert=False)
+            stub.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
+            self.assertEqual(req.metadata_buffer_index, -1)
             self.assertEqual(stub.disagg_prefill_pending_kv_releases, [])
 
     def test_release_is_immediate_when_nothing_is_in_flight(self):
@@ -181,19 +194,41 @@ class TestSchedulerDefersRelease(CustomTestCase):
         with patch("sglang.srt.disaggregation.prefill.release_kv_cache") as release:
             stub.maybe_defer_kv_release(req)
             release.assert_called_once_with(req, stub.tree_cache, is_insert=True)
+            stub.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
+            self.assertEqual(req.metadata_buffer_index, -1)
 
-    def test_wedged_transfer_cannot_pin_pages_past_the_deadline(self):
+    def test_active_transfer_keeps_pages_pinned(self):
         stub = self._scheduler_stub()
         req = self._req(inflight=True)
-        with patch(
-            "sglang.srt.disaggregation.prefill.release_kv_cache"
-        ) as release, patch(
-            "sglang.srt.disaggregation.prefill.KV_RELEASE_DRAIN_TIMEOUT_S", 0.0
-        ):
+        with patch("sglang.srt.disaggregation.prefill.release_kv_cache") as release:
             stub.maybe_defer_kv_release(req)
             stub.process_pending_kv_releases()
-            release.assert_called_once()
-            self.assertEqual(stub.disagg_prefill_pending_kv_releases, [])
+            stub.process_pending_kv_releases()
+            release.assert_not_called()
+            stub.req_to_metadata_buffer_idx_allocator.free.assert_not_called()
+            self.assertEqual(stub.disagg_prefill_pending_kv_releases, [(req, True)])
+
+    def test_pending_release_keeps_scheduler_non_idle(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.running_batch = MagicMock()
+        scheduler.running_batch.is_empty.return_value = True
+        scheduler.chunked_req = None
+        scheduler.dllm_manager = MagicMock()
+        scheduler.dllm_manager.any_staging_reqs.return_value = False
+        scheduler.last_batch = None
+        scheduler.enable_overlap = False
+        scheduler.ps = ParallelState.trivial()
+        scheduler.running_mbs = []
+        scheduler.waiting_queue = []
+        scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.disagg_prefill_inflight_queue = []
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(queue=[])
+        scheduler.disagg_prefill_pending_kv_releases = [(object(), True)]
+        scheduler.enable_hisparse = False
+        scheduler.enable_hierarchical_cache = False
+
+        self.assertFalse(scheduler.is_fully_idle())
 
 
 if __name__ == "__main__":

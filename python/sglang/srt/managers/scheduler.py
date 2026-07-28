@@ -1288,9 +1288,9 @@ class Scheduler(
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
-            # (req, is_insert, deadline): failed requests whose KV release is
-            # parked until their in-flight transfer chunks drain.
-            self.disagg_prefill_pending_kv_releases: List[Tuple[Req, bool, float]] = []
+            # (req, is_insert): failed requests whose KV and metadata release
+            # is parked until their in-flight transfer chunks drain.
+            self.disagg_prefill_pending_kv_releases: List[Tuple[Req, bool]] = []
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
@@ -2710,9 +2710,6 @@ class Scheduler(
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             req.disagg_kv_sender.abort()
-            maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
-            )
             req.pending_bootstrap = False
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
@@ -3838,6 +3835,7 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                idle &= len(self.disagg_prefill_pending_kv_releases) == 0
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
