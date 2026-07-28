@@ -1167,9 +1167,14 @@ class TestStrictCannotBeDowngraded(unittest.TestCase):
         with patch(
             "sglang.srt.disaggregation.utils.dist.all_reduce",
             side_effect=lambda tensor, **kw: None,
-        ):
+        ) as all_reduce:
             with self.assertRaises(KVTransferBarrierEscalation):
                 poll_and_all_reduce([poller], object())
+        self.assertEqual(
+            all_reduce.call_count,
+            2,
+            "the failing rank must join the quiescence collective before raising",
+        )
 
     def test_an_ordinary_backend_fault_escalates_when_fail_closed(self):
         backend_error = RuntimeError("backend bug")
@@ -1187,6 +1192,28 @@ class TestStrictCannotBeDowngraded(unittest.TestCase):
                 poll_and_all_reduce([poller], object())
         self.assertIs(cm.exception.__cause__, backend_error)
         self.assertIn("refusing to release KV pages", str(cm.exception))
+
+    def test_an_escalation_on_another_rank_reaches_this_rank(self):
+        poller = SimpleNamespace(
+            poll=Mock(return_value=KVPoll.Failed),
+            advance_failure_quiescence=Mock(return_value=True),
+            is_failure_quiescing=Mock(return_value=True),
+        )
+        collective_count = 0
+
+        def reduce_with_remote_escalation(tensor, **_kwargs):
+            nonlocal collective_count
+            collective_count += 1
+            if collective_count == 2:
+                tensor[-1] = 0
+
+        with patch(
+            "sglang.srt.disaggregation.utils.dist.all_reduce",
+            side_effect=reduce_with_remote_escalation,
+        ):
+            with self.assertRaises(KVTransferBarrierEscalation) as cm:
+                poll_and_all_reduce([poller], object())
+        self.assertIn("another rank", str(cm.exception))
 
     def test_strict_does_not_accept_a_legacy_ack_as_proof(self):
         # A peer that predates the barrier acknowledges before draining, so its

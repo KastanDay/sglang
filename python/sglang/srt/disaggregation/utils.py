@@ -182,17 +182,40 @@ def _gate_failures_on_quiescence(pollers, polls: List[int], groups) -> List[int]
     group is still holding ownership.
 
     Both collectives are entered on exactly the same iterations on every rank,
-    because the decision is made from the already-reduced poll values.
+    because the decision is made from the already-reduced poll values. A local
+    fail-closed escalation is carried through the quiescence collective before
+    it is raised so peers do not wait in a collective that the failing rank
+    skipped.
     """
     failed = [poll == int(KVPoll.Failed) for poll in polls]
     if not any(failed):
         return polls
 
-    quiesced = [
-        _advance_quiescence(poller) if is_failed else 1
-        for poller, is_failed in zip(pollers, failed)
-    ]
-    quiesced = _reduce_polls(quiesced, groups)
+    local_escalation = None
+    quiesced = []
+    for poller, is_failed in zip(pollers, failed):
+        if not is_failed:
+            quiesced.append(1)
+            continue
+        try:
+            quiesced.append(_advance_quiescence(poller))
+        except KVTransferBarrierEscalation as e:
+            local_escalation = local_escalation or e
+            quiesced.append(0)
+
+    reduced = _reduce_polls(
+        quiesced + [int(local_escalation is None)],
+        groups,
+    )
+    quiesced, no_rank_escalated = reduced[:-1], reduced[-1]
+    if not no_rank_escalated:
+        if local_escalation is not None:
+            raise local_escalation
+        raise KVTransferBarrierEscalation(
+            "Transfer quiescence check failed on another rank under a "
+            "fail-closed policy; refusing to release KV pages without proof"
+        )
+
     return [
         int(KVPoll.Transferring) if is_failed and not ok else poll
         for poll, is_failed, ok in zip(polls, failed, quiesced)
