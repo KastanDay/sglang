@@ -1,0 +1,33 @@
+test/registered/unit/managers/test_tokenizer_manager_parallel_sampling.py
+  s_1787a638fb71e0::t_9d7a00b5b6870c 34,37,43
+python/sglang/srt/disaggregation/common/conn.py
+  s_1787a638fb71e0::t_f8c56e9126e78a 478-492
+python/sglang/srt/disaggregation/mooncake/conn.py
+  s_1787a638fb71e0::t_08b3e31fba8244 1593-1595
+python/sglang/srt/disaggregation/nixl/conn.py
+  s_1787a638fb71e0::t_1cd86959797e78 2432-2434
+python/sglang/srt/managers/tokenizer_manager.py
+  s_1787a638fb71e0::t_56bba278e70fcc 158-161,166,172-178,1711-1714
+sgl-model-gateway/src/routers/http/pd_router.rs
+  s_1787a638fb71e0::t_b13dd7af81e5bd 214-217,1803-1829
+test/registered/unit/disaggregation/test_common_kv_status.py
+  s_1787a638fb71e0::t_4472b370b09208 189-202
+test/registered/unit/disaggregation/test_nixl_backend_basic.py
+  s_1787a638fb71e0::t_61602cddbbc732 521
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a64d1d6967a84cd642d315a9cf84cb7d45007ef0",
+  "prompts": {},
+  "sessions": {
+    "s_1787a638fb71e0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fa6c1-3964-71f0-b109-67e1ea3ce383",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Kastan Day <kastan@cloudflare.com>"
+    }
+  }
+}
