@@ -2504,38 +2504,27 @@ class MooncakeKVReceiver(CommonKVReceiver):
         self._peer_lacks_barrier = False
         self._last_abort_send = float("-inf")
         self._abort_lock = threading.Lock()
-        # Per-room state (ABORT_ACK routing, staging teardown) may only be
-        # touched by the receiver that owns the room. A second live receiver for
-        # the same bootstrap_room means the room numbers collided upstream:
-        # everything keyed by room is then ambiguous. Claim before the common
-        # initializer writes any room-keyed state so the loser cannot change the
-        # owner's status or address tracking.
+        # Per-room state (ABORT_ACK routing, status, staging teardown) may only
+        # be touched by the receiver that owns the room. A second live receiver
+        # for the same bootstrap_room means the room numbers collided upstream:
+        # everything keyed by room is then ambiguous, so the loser concludes
+        # Failed immediately. It still constructs normally -- the common
+        # initializer's shared writes are idempotent (address tracking) or
+        # monotonic (status) -- but init(), send_metadata(), abort(), and
+        # clear() all stop at the ownership check, so it can never publish
+        # destinations for the room or tear down the owner's state.
         self.bootstrap_room = bootstrap_room
-        self.bootstrap_addr = bootstrap_addr
-        self.kv_mgr = mgr
         self._owns_room = mgr.register_receiver(self)
+        super().__init__(mgr, bootstrap_addr, bootstrap_room)
         if not self._owns_room:
+            logger.error("%s; failing the new receiver", self._collision_reason())
             self.conclude_state = KVPoll.Failed
-            self.require_staging = False
-            self.init_time = None
-            self.abort_notified = False
-            self._room_collision_error = (
-                f"bootstrap_room {self.bootstrap_room} is already in use by an "
-                "unfinished KV transfer"
-            )
-            logger.error(
-                "%s; rejecting the colliding receiver before it can touch "
-                "room-keyed state",
-                self._room_collision_error,
-            )
-            return
-        try:
-            super().__init__(mgr, bootstrap_addr, bootstrap_room)
-        except Exception:
-            # Do not strand the room registration if construction fails before
-            # the receiver becomes operational.
-            mgr.unregister_receiver(self)
-            raise
+
+    def _collision_reason(self) -> str:
+        return (
+            f"bootstrap_room {self.bootstrap_room} is already in use by an "
+            "unfinished KV transfer; colliding rooms make per-room state ambiguous"
+        )
 
     def init(self, prefill_dp_rank: int):
         if not self._owns_room:
@@ -2719,19 +2708,12 @@ class MooncakeKVReceiver(CommonKVReceiver):
         self._close_barrier()
         if self._quiesce_complete or not self._metadata_sent:
             # No prefill rank was ever handed this request's page indices, so
-            # nothing can be writing into them.
+            # nothing can be writing into them. In particular a receiver that
+            # lost its room never sends metadata, so it always concludes here.
             return True
         if self.kv_mgr.transfer_barrier == TransferBarrierLevel.OFF:
             self._quiesce_complete = True
             return True
-        if not self._owns_room:
-            # Another live receiver owns this bootstrap_room, so our ABORT_ACKs
-            # are routed to it and proof can never reach us. Do not pretend to
-            # wait for it; the collision itself is already reported as an error.
-            return self._conclude_without_proof(
-                f"bootstrap_room {self.bootstrap_room} is owned by another "
-                "receiver, so its acknowledgements are unroutable"
-            )
         if self._peers_quiesced():
             self._quiesce_complete = True
             self.kv_mgr.forget_unquiesced(self.bootstrap_room)
@@ -2886,7 +2868,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         if not self._owns_room:
             raise KVTransferError(
                 self.bootstrap_room,
-                self._room_collision_error,
+                self._collision_reason(),
                 is_from_another_rank=False,
             )
 

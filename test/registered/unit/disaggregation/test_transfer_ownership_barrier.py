@@ -1198,16 +1198,17 @@ class TestBarrierLevels(unittest.TestCase):
             self.assertTrue(sender.advance_failure_quiescence())
             metric.inc.assert_not_called()
 
-    def test_a_receiver_that_lost_its_room_does_not_wait_for_unroutable_proof(self):
+    def test_a_receiver_that_lost_its_room_concludes_without_waiting(self):
+        # A loser's send_metadata() is a guarded no-op, so it can never have
+        # exposed its pages and must conclude on the first poll rather than
+        # waiting for acknowledgements that are routed to the owner.
         mgr = make_decode_manager()
-        receiver = make_receiver(mgr, bootstrap_infos=[{"rank": 0}])
+        receiver = make_receiver(
+            mgr, bootstrap_infos=[{"rank": 0}], metadata_sent=False
+        )
         receiver._owns_room = False
-        with patch("sglang.srt.disaggregation.mooncake.conn.TRANSFER_QUIESCE_TIMEOUTS"):
-            self.assertTrue(
-                receiver.advance_failure_quiescence(),
-                "ACKs are routed to the owning receiver, so this one can never "
-                "receive proof and must not wait for it",
-            )
+        receiver.send_metadata(np.array([123], dtype=np.int32))
+        self.assertTrue(receiver.advance_failure_quiescence())
 
 
 class TestStrictCannotBeDowngraded(unittest.TestCase):
@@ -1423,7 +1424,7 @@ class TestRoomStateRetirement(unittest.TestCase):
 class TestRoomCollisionIsolation(unittest.TestCase):
     """A receiver that lost a room collision must not damage the owner."""
 
-    def test_constructor_rejects_loser_before_shared_state_or_metadata(self):
+    def test_collision_loser_fails_locally_without_damaging_the_owner(self):
         mgr = make_decode_manager()
         mgr.get_session_id = Mock(side_effect=["owner", "loser"])
         mgr.addr_to_rooms_tracker = {"prefill:1": set()}
@@ -1437,13 +1438,19 @@ class TestRoomCollisionIsolation(unittest.TestCase):
         self.assertIs(mgr._receivers[ROOM], owner)
         self.assertEqual(loser.poll(), KVPoll.Failed)
         self.assertFalse(loser._owns_room)
-        mgr.update_status.assert_not_called()
+        # The only shared write a loser may make is the monotonic status floor
+        # from the common initializer, which cannot regress the owner's status.
+        mgr.update_status.assert_called_once_with(ROOM, KVPoll.Bootstrapping)
+        mgr.record_failure.assert_not_called()
         self.assertEqual(mgr.addr_to_rooms_tracker["prefill:1"], {ROOM})
 
+        mgr.update_status.reset_mock()
         loser.init(0)
         loser.send_metadata(np.array([123], dtype=np.int32))
         loser.abort()
         mgr.update_status.assert_not_called()
+        mgr.record_failure.assert_not_called()
+        self.assertEqual(mgr.required_prefill_response_num_table, {})
         self.assertIs(mgr._receivers[ROOM], owner)
 
     def test_the_loser_does_not_tear_down_shared_state(self):
