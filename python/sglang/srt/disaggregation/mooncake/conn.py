@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
-import itertools
 import logging
 import os
 import queue
 import struct
 import threading
 import time
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -45,6 +44,10 @@ from sglang.srt.disaggregation.common.utils import (
     pack_int_lists,
     submit_transfer_calls,
     unpack_int_lists,
+)
+from sglang.srt.disaggregation.mooncake.room_lifetime import (
+    RoomLifetimeRegistry,
+    RoomTransferLifetime,
 )
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
@@ -92,131 +95,6 @@ ABORT_ACK_MAX_AGE_S = 60.0
 # Hard cap on owed ABORT_ACKs, so an abort storm against a dead peer cannot grow
 # the pending list, or the per-tick sweep over it, without bound.
 MAX_PENDING_ABORT_ACKS = 4096
-# Soft cap on tracked room lifetimes. Reaching it means the periodic sweep is not
-# keeping up, so an insert also does a *bounded* scan for reclaimable rooms.
-MAX_TRACKED_ROOMS = 4096
-# Entries examined per emergency scan, so an insert can never become O(n).
-MAX_EMERGENCY_SCAN = 256
-
-
-class RoomTransferLifetime:
-    """Ownership barrier for one bootstrap room's KV pages on this rank.
-
-    Mooncake transfers hand raw KV pointers to native code (RDMA, the transfer
-    executor, CUDA staging copies). Those readers and writers outlive the
-    Python call that started them, so a request that becomes terminal while
-    they run would let the allocator hand the same pages to another request.
-
-    Every piece of native transfer work holds a *lease*. ``close()`` stops new
-    leases from being handed out; the room is *quiesced* once it is closed and
-    every outstanding lease has been returned. Only then is it safe to release
-    the room's KV pages.
-
-    Abort tokens minted by decode peers are recorded here so that a late or
-    duplicated abort for a recycled room cannot close a live room.
-    """
-
-    __slots__ = ("_cond", "_leases", "_open", "_abort_tokens", "created_at", "_claimed")
-
-    def __init__(self) -> None:
-        self._cond = threading.Condition()
-        self._leases = 0
-        self._open = True
-        self._abort_tokens: set = set()
-        self.created_at = time.monotonic()
-        # True once a local sender has taken responsibility for the room. An
-        # unclaimed room was created by decode metadata alone, so nothing will
-        # ever release it and the sweep must.
-        self._claimed = False
-
-    def try_lease(self) -> bool:
-        """Take a lease, or return False if the room no longer admits work."""
-        with self._cond:
-            if not self._open:
-                return False
-            self._leases += 1
-            return True
-
-    def end_lease(self) -> None:
-        with self._cond:
-            self._leases -= 1
-            if self._leases == 0:
-                self._cond.notify_all()
-
-    def close(self) -> None:
-        """Stop admitting transfer work (idempotent)."""
-        with self._cond:
-            self._open = False
-            if self._leases == 0:
-                self._cond.notify_all()
-
-    def is_closed(self) -> bool:
-        with self._cond:
-            return not self._open
-
-    def is_quiesced(self) -> bool:
-        with self._cond:
-            return not self._open and self._leases == 0
-
-    def outstanding_leases(self) -> int:
-        with self._cond:
-            return self._leases
-
-    def claim(self) -> None:
-        with self._cond:
-            self._claimed = True
-
-    def is_claimed(self) -> bool:
-        with self._cond:
-            return self._claimed
-
-    def is_reclaimable(self) -> bool:
-        """Whether this room has no active local transfer ownership.
-
-        A quiesced room admits no work and has none running. An unclaimed room
-        has no sender *yet*, so callers must additionally preserve it for the
-        bootstrap grace period in which a metadata-late sender may still arrive.
-        """
-        with self._cond:
-            return (not self._open and self._leases == 0) or not self._claimed
-
-    def wait_quiesced(self, timeout: Optional[float]) -> bool:
-        """Block until quiesced. Returns False if *timeout* elapsed first."""
-        with self._cond:
-            return self._cond.wait_for(
-                lambda: not self._open and self._leases == 0, timeout
-            )
-
-    def add_abort_token(self, token: bytes) -> None:
-        if not token:
-            return
-        with self._cond:
-            self._abort_tokens.add(token)
-
-    def authorizes_abort(self, token: bytes) -> bool:
-        """Whether *token* may close this room.
-
-        A tokenless abort comes from a peer that predates the token protocol and
-        is honoured unconditionally, as before.
-
-        A room that has not received any decode metadata yet has no tokens to
-        compare against, and accepts the abort. That is deliberate, and it is the
-        safe direction of the trade: an abort can legitimately arrive before this
-        rank has any metadata for the room (the decode gave up during bootstrap),
-        and dropping it would leave this rank free to transfer into pages the
-        decode has already released -- the corruption this barrier exists to
-        prevent. Accepting instead risks one spurious request failure if a
-        recycled bootstrap_room draws a delayed abort from its previous occupant,
-        which is availability rather than correctness, and requires a collision in
-        a 64-bit space. Distinguishing the two cases would need a generation tag
-        on every room-scoped message; that is not worth a wire change here.
-        """
-        if not token:
-            return True
-        with self._cond:
-            return not self._abort_tokens or token in self._abort_tokens
-
-
 @dataclasses.dataclass
 class _PendingAbortAck:
     """An ABORT_ACK owed to a decode rank once its room has drained."""
@@ -366,8 +244,10 @@ class MooncakeKVManager(CommonKVManager):
             # lifecycle with self.transfer_infos: created when the room is first
             # seen (by the sender or by decode metadata, whichever comes first)
             # and dropped by MooncakeKVSender.clear().
-            self._room_lifetimes: OrderedDict[int, RoomTransferLifetime] = OrderedDict()
-            self._room_lifetimes_lock = threading.Lock()
+            self._room_registry = RoomLifetimeRegistry(
+                sweep_ttl=max(1.0, float(self.bootstrap_timeout)),
+                on_retire=self._drop_room_state,
+            )
             self._start_transfer_bookkeeping()
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
@@ -446,90 +326,15 @@ class MooncakeKVManager(CommonKVManager):
     # Transfer ownership barrier (prefill side)
     # ------------------------------------------------------------------
 
-    def _room_lifetime(
-        self, room: int, *, create: bool
-    ) -> Optional[RoomTransferLifetime]:
-        with self._room_lifetimes_lock:
-            return self._room_lifetime_locked(room, create=create)
+    def _drop_room_state(self, room: int) -> None:
+        """Forget the room-keyed state that outlives a retired lifetime.
 
-    def _room_lifetime_locked(
-        self, room: int, *, create: bool
-    ) -> Optional[RoomTransferLifetime]:
-        """Return a room lifetime while the caller holds its generation lock."""
-        lifetime = self._room_lifetimes.get(room)
-        if lifetime is None and create:
-            # Reclaim before inserting, so the entry being created can never be
-            # the one that gets evicted.
-            if len(self._room_lifetimes) >= MAX_TRACKED_ROOMS:
-                self._emergency_reclaim_rooms_locked()
-            lifetime = self._room_lifetimes[room] = RoomTransferLifetime()
-        return lifetime
-
-    def _retire_rooms_locked(self, rooms: List[int]) -> None:
-        """Forget every piece of state keyed by these rooms, atomically.
-
-        Must happen under ``_room_lifetimes_lock`` and in one step: dropping the
-        lifetime first and the rest afterwards would let a request that draws the
-        same bootstrap_room in between have its own destinations and status
-        deleted, and leaving them behind would let it inherit the old decode's
-        addresses.
+        Runs under the registry lock, in the same step that removes the
+        lifetime (see ``RoomLifetimeRegistry`` on why retirement is atomic).
         """
-        for room in rooms:
-            del self._room_lifetimes[room]
-            self.transfer_infos.pop(room, None)
-            self.req_to_decode_prefix_len.pop(room, None)
-            self.request_status.pop(room, None)
-
-    def _emergency_reclaim_rooms_locked(self) -> None:
-        """Bounded reclaim when the periodic sweep is not keeping up.
-
-        Scans at most ``MAX_EMERGENCY_SCAN`` of the oldest entries so an insert
-        can never degrade to O(tracked rooms); the sweep does the rest. The
-        normal bootstrap grace period still applies: the cap is soft when every
-        candidate may still be waiting for its local sender.
-        """
-        # islice over the live view keeps this O(MAX_EMERGENCY_SCAN); the keys are
-        # copied out first because the dict cannot be mutated while iterating.
-        cutoff = time.monotonic() - self._room_sweep_ttl
-        candidates = [
-            room
-            for room, lifetime in itertools.islice(
-                self._room_lifetimes.items(), MAX_EMERGENCY_SCAN
-            )
-            if lifetime.created_at <= cutoff and lifetime.is_reclaimable()
-        ]
-        self._retire_rooms_locked(candidates)
-        if not candidates:
-            logger.warning_once(
-                "Tracking more than %d Mooncake bootstrap rooms with none old "
-                "enough and reclaimable; allowing the soft cap to grow while "
-                "metadata-first rooms remain inside their bootstrap window.",
-                MAX_TRACKED_ROOMS,
-            )
-
-    def _sweep_room_lifetimes(self) -> int:
-        """Reclaim rooms that no local sender will ever release.
-
-        Entries younger than the bootstrap timeout are always kept: that is the
-        window in which a sender may still appear and claim the room, and in
-        which a tombstone must keep rejecting a late abort. After it, a quiesced
-        or never-claimed room is dead weight.
-        """
-        cutoff = time.monotonic() - self._room_sweep_ttl
-        with self._room_lifetimes_lock:
-            stale = [
-                room
-                for room, lifetime in self._room_lifetimes.items()
-                if lifetime.created_at <= cutoff and lifetime.is_reclaimable()
-            ]
-            self._retire_rooms_locked(stale)
-        if stale:
-            logger.debug("Reclaimed %d abandoned Mooncake rooms", len(stale))
-        return len(stale)
-
-    def _forget_room_lifetime(self, room: int) -> None:
-        with self._room_lifetimes_lock:
-            self._room_lifetimes.pop(room, None)
+        self.transfer_infos.pop(room, None)
+        self.req_to_decode_prefix_len.pop(room, None)
+        self.request_status.pop(room, None)
 
     def try_lease_room(self, room: int) -> Optional[RoomTransferLifetime]:
         """Take a transfer lease on *room*, or None if it admits no more work.
@@ -539,7 +344,7 @@ class MooncakeKVManager(CommonKVManager):
         use-after-free this barrier exists to prevent. Callers must return the
         lease with ``end_lease()`` from a ``finally`` block.
         """
-        lifetime = self._room_lifetime(room, create=False)
+        lifetime = self._room_registry.get(room)
         if lifetime is None or not lifetime.try_lease():
             return None
         return lifetime
@@ -556,7 +361,7 @@ class MooncakeKVManager(CommonKVManager):
         may be leased.
         """
         owner = kv_chunk.owner
-        lifetime = self._room_lifetime(kv_chunk.room, create=False)
+        lifetime = self._room_registry.get(kv_chunk.room)
         if lifetime is None or (owner is not None and owner is not lifetime):
             return None
         if not lifetime.try_lease():
@@ -570,13 +375,13 @@ class MooncakeKVManager(CommonKVManager):
         a decode abort overtakes this rank's sender: transferring then would
         write into pages the decode instance has released.
         """
-        lifetime = self._room_lifetime(room, create=True)
+        lifetime = self._room_registry.get_or_create(room)
         lifetime.claim()
         return not lifetime.is_closed()
 
     def close_room_transfers(self, room: int) -> Optional[RoomTransferLifetime]:
         """Stop admitting transfers for *room* (no-op if already released)."""
-        lifetime = self._room_lifetime(room, create=False)
+        lifetime = self._room_registry.get(room)
         if lifetime is not None:
             lifetime.close()
         return lifetime
@@ -590,7 +395,7 @@ class MooncakeKVManager(CommonKVManager):
         the prefill sender still leaves a tombstone; the sender then fails the
         request instead of transferring into pages the decode has released.
         """
-        lifetime = self._room_lifetime(room, create=False)
+        lifetime = self._room_registry.get(room)
         if lifetime is not None and not lifetime.authorizes_abort(token):
             logger.debug(
                 "Ignoring abort for room %s: token was not issued for this room",
@@ -598,7 +403,7 @@ class MooncakeKVManager(CommonKVManager):
             )
             return None
         if lifetime is None:
-            lifetime = self._room_lifetime(room, create=True)
+            lifetime = self._room_registry.get_or_create(room)
         lifetime.close()
         return lifetime
 
@@ -614,7 +419,6 @@ class MooncakeKVManager(CommonKVManager):
         self._abort_ack_queue: queue.Queue[_PendingAbortAck] = queue.Queue()
         self._abort_ack_pending: set = set()
         self._abort_ack_lock = threading.Lock()
-        self._room_sweep_ttl = max(1.0, float(self.bootstrap_timeout))
         threading.Thread(
             target=self._transfer_bookkeeping_loop,
             name="MooncakeTransferBookkeeping",
@@ -662,7 +466,7 @@ class MooncakeKVManager(CommonKVManager):
                 now = time.monotonic()
                 if now >= next_sweep:
                     next_sweep = now + ROOM_SWEEP_INTERVAL_S
-                    self._sweep_room_lifetimes()
+                    self._room_registry.sweep()
             except Exception:
                 # Belt and braces: _drain_abort_acks already isolates individual
                 # entries, but this thread is the only one that can honour an
@@ -2291,8 +2095,8 @@ class MooncakeKVManager(CommonKVManager):
         # transaction. The sweeper takes this same lock, so it cannot retire the
         # lifetime between validation and publication and leave orphan metadata
         # that a later generation could inherit.
-        with self._room_lifetimes_lock:
-            lifetime = self._room_lifetime_locked(room, create=True)
+        with self._room_registry.lock:
+            lifetime = self._room_registry.get_or_create_locked(room)
             if lifetime.is_closed():
                 logger.debug(
                     "Dropping KV metadata for room %s: transfers are closed", room
@@ -2421,7 +2225,7 @@ class MooncakeKVManager(CommonKVManager):
             )
             return
 
-        lifetime = self._room_lifetime(bootstrap_room, create=False)
+        lifetime = self._room_registry.get(bootstrap_room)
         if lifetime is None or lifetime.is_closed():
             # The room was aborted (possibly by a decode notification that
             # overtook this rank's own bookkeeping) or already released.
@@ -2615,7 +2419,7 @@ class MooncakeKVSender(CommonKVSender):
         self._close_barrier()
         if self.kv_mgr.transfer_barrier == TransferBarrierLevel.OFF:
             return True
-        lifetime = self.kv_mgr._room_lifetime(self.bootstrap_room, create=False)
+        lifetime = self.kv_mgr._room_registry.get(self.bootstrap_room)
         if lifetime is None or lifetime.is_quiesced():
             self.kv_mgr.forget_unquiesced(self.bootstrap_room)
             return True
@@ -2635,7 +2439,7 @@ class MooncakeKVSender(CommonKVSender):
     def clear(self) -> None:
         super().clear()
         self.kv_mgr.forget_unquiesced(self.bootstrap_room)
-        self.kv_mgr._forget_room_lifetime(self.bootstrap_room)
+        self.kv_mgr._room_registry.forget(self.bootstrap_room)
 
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank

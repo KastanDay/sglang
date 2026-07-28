@@ -14,7 +14,6 @@ import concurrent.futures
 import threading
 import time
 import unittest
-from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -34,12 +33,15 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.mooncake.conn import (
     ABORT_RETRY_INTERVAL_S,
-    MAX_EMERGENCY_SCAN,
     MooncakeKVManager,
     MooncakeKVReceiver,
     MooncakeKVSender,
-    RoomTransferLifetime,
     TransferInfo,
+)
+from sglang.srt.disaggregation.mooncake.room_lifetime import (
+    MAX_EMERGENCY_SCAN,
+    RoomLifetimeRegistry,
+    RoomTransferLifetime,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode, poll_and_all_reduce
 from sglang.srt.environ import TransferBarrierLevel
@@ -63,9 +65,9 @@ def make_prefill_manager(
     mgr._unquiesced_rooms = set()
     mgr._unquiesced_lock = threading.Lock()
     mgr.bootstrap_timeout = 300
-    mgr._room_sweep_ttl = room_sweep_ttl
-    mgr._room_lifetimes = OrderedDict()
-    mgr._room_lifetimes_lock = threading.Lock()
+    mgr._room_registry = RoomLifetimeRegistry(
+        sweep_ttl=room_sweep_ttl, on_retire=mgr._drop_room_state
+    )
     mgr._endpoint_send_locks = {}
     mgr._endpoint_send_locks_lock = threading.Lock()
     mgr.request_status = {}
@@ -263,14 +265,14 @@ class TestPageReuseRace(unittest.TestCase):
             is_last_chunk=False,
             prefill_aux_index=None,
             state_indices=None,
-            owner=mgr._room_lifetime(ROOM, create=False),
+            owner=mgr._room_registry.get(ROOM),
             trace_ctx=Mock(),
         )
         first.clear()  # the request concludes, the room is released
 
         # a new request draws the same bootstrap_room
         make_sender(mgr)
-        self.assertIsNotNone(mgr._room_lifetime(ROOM, create=False))
+        self.assertIsNotNone(mgr._room_registry.get(ROOM))
         self.assertIsNone(
             mgr.try_lease_chunk(stale),
             "the stale chunk must not lease the new request's room",
@@ -460,7 +462,7 @@ class TestPrefillOwnership(unittest.TestCase):
             return 0
 
         mgr.send_kvcache = blocking_send_kvcache
-        lifetime = mgr._room_lifetime(ROOM, create=True)
+        lifetime = mgr._room_registry.get_or_create(ROOM)
         sender = make_sender(mgr)
 
         queue = FastQueue()
@@ -506,17 +508,17 @@ class TestPrefillOwnership(unittest.TestCase):
     def test_released_room_cannot_be_resurrected_by_a_queued_chunk(self):
         mgr = make_prefill_manager()
         make_sender(mgr)
-        mgr._forget_room_lifetime(ROOM)
+        mgr._room_registry.forget(ROOM)
         # try_lease_room deliberately refuses to recreate the lifetime, so a
         # chunk that outlived the request cannot start a transfer into pages
         # that have already been handed back to the allocator.
         self.assertIsNone(mgr.try_lease_room(ROOM))
-        self.assertNotIn(ROOM, mgr._room_lifetimes)
+        self.assertNotIn(ROOM, mgr._room_registry.rooms())
 
     def test_quiescence_is_bounded_when_a_transfer_never_returns(self):
         mgr = make_prefill_manager(quiesce_timeout=0.05)
         sender = make_sender(mgr)
-        lifetime = mgr._room_lifetime(ROOM, create=False)
+        lifetime = mgr._room_registry.get(ROOM)
         self.assertTrue(lifetime.try_lease())  # never returned
 
         with patch(
@@ -544,38 +546,44 @@ class TestPrefillOwnership(unittest.TestCase):
         mgr = make_prefill_manager()
         sender = make_sender(mgr)
         sender.clear()
-        self.assertNotIn(ROOM, mgr._room_lifetimes)
+        self.assertNotIn(ROOM, mgr._room_registry.rooms())
         self.assertNotIn(ROOM, mgr.request_status)
 
     def test_tracked_rooms_are_bounded_without_evicting_a_live_room(self):
         mgr = make_prefill_manager()
-        live = mgr._room_lifetime(-1, create=True)
+        live = mgr._room_registry.get_or_create(-1)
         mgr.open_room_transfers(-1)
         self.assertTrue(live.try_lease())
-        with patch("sglang.srt.disaggregation.mooncake.conn.MAX_TRACKED_ROOMS", 4):
+        with patch(
+            "sglang.srt.disaggregation.mooncake.room_lifetime.MAX_TRACKED_ROOMS", 4
+        ):
             for room in range(200):
                 mgr._close_room_for_abort(room, b"").created_at = 0
             # ... and rooms known only from decode metadata, which no local
             # sender will ever release, must be bounded too.
             for room in range(1000, 1200):
-                mgr._room_lifetime(room, create=True).created_at = 0
-        self.assertLessEqual(len(mgr._room_lifetimes), 8)
+                mgr._room_registry.get_or_create(room).created_at = 0
+        self.assertLessEqual(len(mgr._room_registry.rooms()), 8)
         self.assertIn(
-            -1, mgr._room_lifetimes, "a claimed, leased room must never be evicted"
+            -1,
+            mgr._room_registry.rooms(),
+            "a claimed, leased room must never be evicted",
         )
 
     def test_emergency_reclaim_cost_does_not_grow_with_the_map(self):
         # A saturated map of non-reclaimable rooms must not make every new room
         # O(tracked rooms) on the bootstrap thread.
         mgr = make_prefill_manager()
-        with patch("sglang.srt.disaggregation.mooncake.conn.MAX_TRACKED_ROOMS", 8):
+        with patch(
+            "sglang.srt.disaggregation.mooncake.room_lifetime.MAX_TRACKED_ROOMS", 8
+        ):
             for room in range(400):
-                lifetime = mgr._room_lifetime(room, create=True)
+                lifetime = mgr._room_registry.get_or_create(room)
                 mgr.open_room_transfers(room)
                 self.assertTrue(lifetime.try_lease())
             probe = Mock(side_effect=lambda: False)
             with patch.object(RoomTransferLifetime, "is_reclaimable", probe):
-                mgr._room_lifetime(99999, create=True)
+                mgr._room_registry.get_or_create(99999)
         self.assertLessEqual(
             probe.call_count,
             MAX_EMERGENCY_SCAN,
@@ -585,21 +593,21 @@ class TestPrefillOwnership(unittest.TestCase):
     def test_sweep_reclaims_rooms_no_sender_will_release(self):
         mgr = make_prefill_manager(room_sweep_ttl=0.0)
         for room in range(5):
-            mgr._room_lifetime(room, create=True)  # decode metadata only
+            mgr._room_registry.get_or_create(room)  # decode metadata only
         mgr.open_room_transfers(3)  # this one has a local sender
-        self.assertEqual(mgr._sweep_room_lifetimes(), 4)
-        self.assertEqual(list(mgr._room_lifetimes), [3])
+        self.assertEqual(mgr._room_registry.sweep(), 4)
+        self.assertEqual(list(mgr._room_registry.rooms()), [3])
 
     def test_sweep_keeps_young_rooms_so_a_late_sender_still_finds_them(self):
         mgr = make_prefill_manager(room_sweep_ttl=300.0)
-        mgr._room_lifetime(1, create=True)
-        self.assertEqual(mgr._sweep_room_lifetimes(), 0)
-        self.assertIn(1, mgr._room_lifetimes)
+        mgr._room_registry.get_or_create(1)
+        self.assertEqual(mgr._room_registry.sweep(), 0)
+        self.assertIn(1, mgr._room_registry.rooms())
 
     def test_barrier_can_be_disabled(self):
         mgr = make_prefill_manager(barrier=TransferBarrierLevel.OFF)
         sender = make_sender(mgr)
-        lifetime = mgr._room_lifetime(ROOM, create=False)
+        lifetime = mgr._room_registry.get(ROOM)
         self.assertTrue(lifetime.try_lease())
         with patch(
             "sglang.srt.disaggregation.mooncake.conn.TRANSFER_QUIESCE_TIMEOUTS"
@@ -645,9 +653,7 @@ class TestPrefillAbortProtocol(unittest.TestCase):
         self.assertTrue(mgr._handle_bootstrap_metadata(self._metadata_msg()))
         self.assertEqual(mgr.request_status[ROOM], KVPoll.WaitingForInput)
         self.assertIn("session:1", mgr.transfer_infos[ROOM])
-        self.assertTrue(
-            mgr._room_lifetime(ROOM, create=False).authorizes_abort(b"token")
-        )
+        self.assertTrue(mgr._room_registry.get(ROOM).authorizes_abort(b"token"))
 
     def test_abort_arriving_before_the_sender_fails_the_request(self):
         mgr = self._bootstrap_thread_state(make_prefill_manager())
@@ -678,9 +684,9 @@ class TestPrefillAbortProtocol(unittest.TestCase):
         mgr = self._bootstrap_thread_state(make_prefill_manager())
         mgr._handle_bootstrap_metadata(self._metadata_msg(token=b"real"))
         self.assertIsNone(mgr._close_room_for_abort(ROOM, b"stale"))
-        self.assertFalse(mgr._room_lifetime(ROOM, create=False).is_closed())
+        self.assertFalse(mgr._room_registry.get(ROOM).is_closed())
         self.assertIsNotNone(mgr._close_room_for_abort(ROOM, b"real"))
-        self.assertTrue(mgr._room_lifetime(ROOM, create=False).is_closed())
+        self.assertTrue(mgr._room_registry.get(ROOM).is_closed())
 
     def test_abort_ack_is_withheld_until_the_room_drains(self):
         mgr = make_prefill_manager()
@@ -688,7 +694,7 @@ class TestPrefillAbortProtocol(unittest.TestCase):
         sent = []
         mgr._send_manager_message = lambda ip, port, parts, **kw: sent.append(parts)
 
-        lifetime = mgr._room_lifetime(ROOM, create=True)
+        lifetime = mgr._room_registry.get_or_create(ROOM)
         self.assertTrue(lifetime.try_lease())
         lifetime.close()
 
@@ -711,7 +717,7 @@ class TestPrefillAbortProtocol(unittest.TestCase):
         mgr._send_manager_message = Mock()
         lifetimes = []
         for room in range(64):
-            lifetime = mgr._room_lifetime(room, create=True)
+            lifetime = mgr._room_registry.get_or_create(room)
             self.assertTrue(lifetime.try_lease())
             lifetime.close()
             lifetimes.append(lifetime)
@@ -1132,7 +1138,7 @@ class TestBarrierLevels(unittest.TestCase):
         mgr = make_prefill_manager(quiesce_timeout=0.01, barrier=barrier)
         mgr.max_unquiesced = max_unquiesced
         sender = make_sender(mgr)
-        lifetime = mgr._room_lifetime(ROOM, create=False)
+        lifetime = mgr._room_registry.get(ROOM)
         self.assertTrue(lifetime.try_lease())  # a worker that never returns
         return mgr, sender
 
@@ -1309,10 +1315,12 @@ class TestRoomStateRetirement(unittest.TestCase):
         mgr = make_prefill_manager()
         self._room_with_metadata(mgr)
         self.assertIn(ROOM, mgr.transfer_infos)
-        mgr._room_lifetimes[ROOM].created_at = 0
-        with patch("sglang.srt.disaggregation.mooncake.conn.MAX_TRACKED_ROOMS", 1):
-            mgr._room_lifetime(ROOM + 1, create=True)
-        self.assertNotIn(ROOM, mgr._room_lifetimes)
+        mgr._room_registry.get(ROOM).created_at = 0
+        with patch(
+            "sglang.srt.disaggregation.mooncake.room_lifetime.MAX_TRACKED_ROOMS", 1
+        ):
+            mgr._room_registry.get_or_create(ROOM + 1)
+        self.assertNotIn(ROOM, mgr._room_registry.rooms())
         self.assertNotIn(ROOM, mgr.transfer_infos)
         self.assertNotIn(ROOM, mgr.request_status)
         self.assertNotIn(ROOM, mgr.req_to_decode_prefix_len)
@@ -1321,13 +1329,17 @@ class TestRoomStateRetirement(unittest.TestCase):
         mgr = make_prefill_manager(room_sweep_ttl=300.0)
         self._room_with_metadata(mgr)
 
-        with patch("sglang.srt.disaggregation.mooncake.conn.MAX_TRACKED_ROOMS", 1):
-            mgr._room_lifetime(ROOM + 1, create=True)
+        with patch(
+            "sglang.srt.disaggregation.mooncake.room_lifetime.MAX_TRACKED_ROOMS", 1
+        ):
+            mgr._room_registry.get_or_create(ROOM + 1)
 
-        self.assertIn(ROOM, mgr._room_lifetimes)
+        self.assertIn(ROOM, mgr._room_registry.rooms())
         self.assertIn(ROOM, mgr.transfer_infos)
         self.assertIn(ROOM, mgr.request_status)
-        self.assertEqual(len(mgr._room_lifetimes), 2, "the tracked-room cap is soft")
+        self.assertEqual(
+            len(mgr._room_registry.rooms()), 2, "the tracked-room cap is soft"
+        )
 
     def test_metadata_publication_holds_the_lifetime_generation_lock(self):
         mgr = make_prefill_manager()
@@ -1338,7 +1350,7 @@ class TestRoomStateRetirement(unittest.TestCase):
 
         def assert_generation_locked():
             self.assertTrue(
-                mgr._room_lifetimes_lock.locked(),
+                mgr._room_registry.lock.locked(),
                 "room metadata must publish under the lifetime generation lock",
             )
 
@@ -1356,7 +1368,7 @@ class TestRoomStateRetirement(unittest.TestCase):
         mgr.request_status = GenerationGuardedDict()
 
         self._room_with_metadata(mgr)
-        self.assertIn(ROOM, mgr._room_lifetimes)
+        self.assertIn(ROOM, mgr._room_registry.rooms())
         self.assertIn(ROOM, mgr.transfer_infos)
         self.assertIn(ROOM, mgr.request_status)
 
@@ -1366,14 +1378,14 @@ class TestRoomStateRetirement(unittest.TestCase):
         mgr = make_prefill_manager(room_sweep_ttl=0.0)
         self._room_with_metadata(mgr)
         observed = {}
-        real_retire = mgr._retire_rooms_locked
+        real_drop = mgr._drop_room_state
 
-        def retire(rooms):
-            observed["held"] = mgr._room_lifetimes_lock.locked()
-            real_retire(rooms)
+        def drop(room):
+            observed["held"] = mgr._room_registry.lock.locked()
+            real_drop(room)
 
-        mgr._retire_rooms_locked = retire
-        self.assertEqual(mgr._sweep_room_lifetimes(), 1)
+        mgr._room_registry._on_retire = drop
+        self.assertEqual(mgr._room_registry.sweep(), 1)
         self.assertTrue(observed["held"], "retirement must run under the lifetime lock")
 
     def test_sweep_retires_destinations_and_status_together(self):
@@ -1401,8 +1413,8 @@ class TestRoomStateRetirement(unittest.TestCase):
         self.assertIn(ROOM, mgr.transfer_infos)
         self.assertIn(ROOM, mgr.request_status)
 
-        self.assertEqual(mgr._sweep_room_lifetimes(), 1)
-        self.assertNotIn(ROOM, mgr._room_lifetimes)
+        self.assertEqual(mgr._room_registry.sweep(), 1)
+        self.assertNotIn(ROOM, mgr._room_registry.rooms())
         self.assertNotIn(ROOM, mgr.transfer_infos)
         self.assertNotIn(ROOM, mgr.request_status)
         self.assertNotIn(ROOM, mgr.req_to_decode_prefix_len)
