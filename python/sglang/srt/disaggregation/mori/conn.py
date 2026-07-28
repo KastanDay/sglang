@@ -416,18 +416,6 @@ class MoriKVManager(CommonKVManager):
                 component_descs.append(desc)
             self.state_mem_descs.append(component_descs)
 
-    def update_status(self, bootstrap_room: int, status: KVPoll):
-        current = self.request_status.get(bootstrap_room)
-        if current is None:
-            # Room not yet created or already cleared.
-            # Only allow the synchronous room-initialization transition.
-            if status != KVPoll.Bootstrapping:
-                return
-        elif current == KVPoll.Failed and status != KVPoll.Failed:
-            # Failed is terminal — never overwrite with non-Failed.
-            return
-        super().update_status(bootstrap_room, status)
-
     def enqueue_transfer(self, task: _TransferChunk) -> None:
         self._transfer_queues[task.sender.bootstrap_room % self._num_shards].put(task)
 
@@ -504,19 +492,12 @@ class MoriKVManager(CommonKVManager):
                     return
                 infos = self.transfer_infos.setdefault(transfer_info.room, {})
                 infos[transfer_info.engine_key] = transfer_info
-                self._mark_room_ready_if_metadata_complete(transfer_info.room)
+                self._record_metadata_readiness_locked(transfer_info.room)
         except Exception:
             logger.exception("Failed to parse transfer info message")
 
-    def _mark_room_ready_if_metadata_complete(self, bootstrap_room: int) -> None:
-        """Advance a bootstrapped room once all early metadata has arrived.
-
-        Callers hold transfer_lock so metadata arrival and sender construction
-        cannot miss each other.
-        """
-        if self.request_status.get(bootstrap_room) != KVPoll.Bootstrapping:
-            return
-
+    def _record_metadata_readiness_locked(self, bootstrap_room: int) -> None:
+        """Finish metadata processing while the caller holds transfer_lock."""
         infos = self.transfer_infos.get(bootstrap_room)
         if not infos:
             return
@@ -554,7 +535,7 @@ class MoriKVManager(CommonKVManager):
                 bootstrap_room,
                 len(infos),
             )
-        self.update_status(bootstrap_room, KVPoll.WaitingForInput)
+        self.mark_metadata_ready(bootstrap_room)
 
     def _validate_message(self, msg: List[bytes]) -> Optional[List[bytes]]:
         if not msg or msg[0] != MORI_GUARD:
@@ -1417,8 +1398,6 @@ class MoriKVSender(CommonKVSender):
             pp_rank,
             req_has_disagg_prefill_dp_rank,
         )
-        with self.kv_mgr.transfer_lock:
-            self.kv_mgr._mark_room_ready_if_metadata_complete(self.bootstrap_room)
         self.transfer_statuses: List[TransferStatus] = []
         self.pending_infos: Optional[List[TransferInfo]] = None
         self.conclude_state: Optional[KVPoll] = None

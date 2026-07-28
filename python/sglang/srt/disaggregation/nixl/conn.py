@@ -634,12 +634,6 @@ class NixlKVManager(CommonKVManager):
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
 
-    def update_status(self, bootstrap_room: int, status: KVPoll):
-        # Keep Failed sticky until the sender clears the room.
-        if self.request_status.get(bootstrap_room) == KVPoll.Failed:
-            return
-        super().update_status(bootstrap_room, status)
-
     def _prep_equal_tp_dlist(
         self,
         peer_name: str,
@@ -2447,7 +2441,7 @@ class NixlKVManager(CommonKVManager):
                         0,
                     )
                     logger.debug(f"{room=} is bootstrapped")
-                    self.update_status(room, KVPoll.WaitingForInput)
+                    self.mark_metadata_ready(room)
 
         threading.Thread(target=bootstrap_thread).start()
 
