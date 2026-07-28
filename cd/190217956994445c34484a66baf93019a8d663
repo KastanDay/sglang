@@ -1,0 +1,21 @@
+python/sglang/srt/disaggregation/utils.py
+  s_91862ee4e13eb0::t_9dca58b4e9e9c1 185-188,194-218
+test/registered/unit/disaggregation/test_transfer_ownership_barrier.py
+  s_91862ee4e13eb0::t_cc43432cf542ad 1170,1173-1177,1196-1217
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cd190217956994445c34484a66baf93019a8d663",
+  "prompts": {},
+  "sessions": {
+    "s_91862ee4e13eb0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fa6a9-523f-78f3-908c-d5e21b23713f",
+        "model": "unknown"
+      },
+      "human_author": "Kastan Day <kastan@cloudflare.com>"
+    }
+  }
+}
