@@ -174,6 +174,10 @@ class BaseKVSender(ABC):
         """
         pass
 
+    def is_transfer_quiesced(self) -> bool:
+        """Return whether local transfer work has released its source buffers."""
+        return True
+
 
 class BaseKVReceiver(ABC):
     @abstractmethod

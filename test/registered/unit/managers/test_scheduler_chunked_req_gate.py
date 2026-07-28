@@ -3,7 +3,7 @@
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -12,6 +12,8 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
@@ -175,6 +177,53 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
             s, running_batch=s.running_batch, last_batch=s.last_batch
         )
         self.assertIsNone(s.chunked_req)
+
+    def test_chunked_abort_defers_source_release_until_transfer_quiesces(self):
+        sender = MagicMock()
+        sender.poll.return_value = KVPoll.Failed
+        sender.is_transfer_quiesced.side_effect = [False, True]
+        req = SimpleNamespace(
+            rid="aborted-chunk",
+            req_pool_idx=3,
+            return_logprob=False,
+            finished_reason=None,
+            to_finish=object(),
+            pending_bootstrap=False,
+            disagg_kv_sender=sender,
+            time_stats=SimpleNamespace(trace_ctx=MagicMock()),
+        )
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler._pending_chunked_abort_req = req
+        scheduler.chunked_req = req
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        scheduler.req_to_metadata_buffer_idx_allocator = MagicMock()
+        scheduler.enable_hicache_storage = False
+        scheduler.tree_cache = MagicMock()
+        scheduler.ipc_channels = SimpleNamespace(
+            send_to_tokenizer=SimpleNamespace(send_output=MagicMock())
+        )
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler.maybe_release_metadata_buffer"
+            ) as release_metadata,
+            patch("sglang.srt.managers.scheduler.release_kv_cache") as release_kv,
+        ):
+            Scheduler.process_pending_chunked_abort(scheduler)
+
+            sender.abort.assert_called_once()
+            sender.poll.assert_not_called()
+            release_metadata.assert_not_called()
+            release_kv.assert_not_called()
+            self.assertIsNone(scheduler.chunked_req)
+            self.assertIs(scheduler._pending_chunked_abort_req, req)
+
+            Scheduler.process_pending_chunked_abort(scheduler)
+
+            sender.poll.assert_called_once()
+            release_metadata.assert_called_once()
+            release_kv.assert_called_once()
+            self.assertIsNone(scheduler._pending_chunked_abort_req)
 
 
 if __name__ == "__main__":

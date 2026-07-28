@@ -184,6 +184,8 @@ class MooncakeKVManager(CommonKVManager):
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
             ]
+            self._pending_transfer_counts = defaultdict(int)
+            self._pending_transfer_counts_lock = threading.Lock()
             assert transfer_thread_pool_size >= transfer_queue_size, (
                 f"The environment variable SGLANG_DISAGGREGATION_THREAD_POOL_SIZE={transfer_thread_pool_size} must be "
                 f"greater than or equal to SGLANG_DISAGGREGATION_QUEUE_SIZE={transfer_queue_size}."
@@ -682,11 +684,10 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 for (src_ptr, dst_ptr, item_len) in layers_params
             ]
-            for future in concurrent.futures.as_completed(futures):
+            concurrent.futures.wait(futures)
+            for future in futures:
                 status = future.result()
                 if status != 0:
-                    for f in futures:
-                        f.cancel()
                     return status
             return 0
         else:
@@ -831,11 +832,10 @@ class MooncakeKVManager(CommonKVManager):
                 executor.submit(process_layer_tp_aware, src_v_ptrs[i], dst_v_ptrs[i])
             )
 
-        for future in concurrent.futures.as_completed(futures):
+        concurrent.futures.wait(futures)
+        for future in futures:
             status = future.result()
             if status != 0:
-                for f in futures:
-                    f.cancel()
                 return status
 
         return 0
@@ -1276,6 +1276,8 @@ class MooncakeKVManager(CommonKVManager):
             )
 
         while True:
+            kv_chunk = None
+            staging_deferred = False
             try:
                 kv_chunk: TransferKVChunk = queue.get()
                 if self.enable_trace:
@@ -1321,7 +1323,6 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 # When staging transfer is not yet ready (watermark/allocation pending),
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
-                staging_deferred = False
                 for req in reqs_to_be_processed:
                     start_ts = time.perf_counter()
                     if not req.is_dummy:
@@ -1499,6 +1500,9 @@ class MooncakeKVManager(CommonKVManager):
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
+            finally:
+                if kv_chunk is not None and not staging_deferred:
+                    self._finish_transfer(kv_chunk.room)
 
     def start_prefill_thread(self):
         def bootstrap_thread():
@@ -1709,17 +1713,38 @@ class MooncakeKVManager(CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
-        self.transfer_queues[shard_idx].put(
-            TransferKVChunk(
-                room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
-                is_last_chunk=is_last_chunk,
-                prefill_aux_index=aux_index,
-                state_indices=state_indices,
-                trace_ctx=trace_ctx,
+        self._start_transfer(bootstrap_room)
+        try:
+            self.transfer_queues[shard_idx].put(
+                TransferKVChunk(
+                    room=bootstrap_room,
+                    prefill_kv_indices=kv_indices,
+                    index_slice=index_slice,
+                    is_last_chunk=is_last_chunk,
+                    prefill_aux_index=aux_index,
+                    state_indices=state_indices,
+                    trace_ctx=trace_ctx,
+                )
             )
-        )
+        except Exception:
+            self._finish_transfer(bootstrap_room)
+            raise
+
+    def _start_transfer(self, bootstrap_room: int):
+        with self._pending_transfer_counts_lock:
+            self._pending_transfer_counts[bootstrap_room] += 1
+
+    def _finish_transfer(self, bootstrap_room: int):
+        with self._pending_transfer_counts_lock:
+            pending = self._pending_transfer_counts[bootstrap_room] - 1
+            if pending:
+                self._pending_transfer_counts[bootstrap_room] = pending
+            else:
+                self._pending_transfer_counts.pop(bootstrap_room)
+
+    def is_transfer_quiesced(self, bootstrap_room: int) -> bool:
+        with self._pending_transfer_counts_lock:
+            return self._pending_transfer_counts.get(bootstrap_room, 0) == 0
 
     def get_session_id(self):
         return self.engine.get_session_id()
@@ -1854,6 +1879,9 @@ class MooncakeKVSender(CommonKVSender):
         raise KVTransferError(
             self.bootstrap_room, failure_reason, is_from_another_rank=is_propagated
         )
+
+    def is_transfer_quiesced(self) -> bool:
+        return self.kv_mgr.is_transfer_quiesced(self.bootstrap_room)
 
     def _init_trace_ctx(self):
         if self.kv_mgr.enable_trace:

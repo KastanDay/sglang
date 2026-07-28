@@ -44,6 +44,7 @@ from sglang.kernels.ops.mamba.triton_ops import (
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl, is_minimax_sparse
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
+from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -2628,6 +2629,8 @@ class Scheduler(
         ``process_batch_result_disagg_prefill`` via its ``is_aborted`` drop, and
         ``process_batch_result_prefill`` via its chunked branch (the finished req
         is excluded from streaming and its logprob offset is still accounted).
+        A disaggregated sender may still be reading earlier chunks, so its KV and
+        metadata allocations stay live until the sender reports local quiescence.
         Mirrors ``handle_bootstrap_failure``.
         """
         req = self._pending_chunked_abort_req
@@ -2635,16 +2638,26 @@ class Scheduler(
             return
         if self.chunked_req is not req:
             # Already past chunked prefill; the running-batch abort path handles
-            # it. Drop the marker once the request is actually gone.
-            if req.finished() or req.req_pool_idx is None:
-                self._pending_chunked_abort_req = None
-            return
+            # it unless this method already started a deferred transfer abort.
+            if (
+                self.disaggregation_mode != DisaggregationMode.PREFILL
+                or req.disagg_kv_sender.poll() != KVPoll.Failed
+            ):
+                # Drop the marker once the request is actually gone.
+                if req.finished() or req.req_pool_idx is None:
+                    self._pending_chunked_abort_req = None
+                return
+        else:
+            prepare_abort(req, "Aborted")
+            req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
+            req.to_finish = None
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                req.disagg_kv_sender.abort()
+            self.chunked_req = None
 
-        prepare_abort(req, "Aborted")
-        req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
-        req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            req.disagg_kv_sender.abort()
+            if not req.disagg_kv_sender.is_transfer_quiesced():
+                return
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
@@ -2653,7 +2666,6 @@ class Scheduler(
             self.tree_cache.release_aborted_request(req.rid)
         release_kv_cache(req, self.tree_cache, is_insert=False)
 
-        self.chunked_req = None
         self._pending_chunked_abort_req = None
         self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
         logger.debug(f"Abort chunked prefill request. {req.rid=}")

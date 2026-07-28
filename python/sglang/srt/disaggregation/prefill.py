@@ -804,6 +804,12 @@ class SchedulerDisaggregationPrefillMixin:
                     undone_reqs.append(req)
                     continue
 
+            if poll in (KVPoll.Success, KVPoll.Failed) and (
+                not req.disagg_kv_sender.is_transfer_quiesced()
+            ):
+                undone_reqs.append(req)
+                continue
+
             if req.pending_bootstrap:
                 # Parked: prefill finished before bootstrap completed.
                 if self.handle_pending_bootstrap(req, poll):
@@ -912,7 +918,9 @@ class SchedulerDisaggregationPrefillMixin:
         transferred_rids: List[str] = []
 
         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
-            if poll == KVPoll.Success or poll == KVPoll.Failed:
+            if poll in (KVPoll.Success, KVPoll.Failed) and (
+                req.disagg_kv_sender.is_transfer_quiesced()
+            ):
                 transferred_rids.append(req.rid)
 
         return transferred_rids
