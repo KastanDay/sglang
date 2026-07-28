@@ -178,6 +178,7 @@ class CommonKVManager(BaseKVManager):
         self.request_status: Dict[int, KVPoll] = {}
         self._request_status_lock = threading.RLock()
         self._metadata_ready_rooms: Set[int] = set()
+        self._cleared_room_tombstones: Set[int] = set()
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_lock = threading.Lock()
@@ -268,6 +269,9 @@ class CommonKVManager(BaseKVManager):
                 # bootstrap_room reuse inherit stale state.
                 if status != KVPoll.Bootstrapping:
                     return
+                getattr(self, "_cleared_room_tombstones", set()).discard(
+                    bootstrap_room
+                )
                 self.request_status[bootstrap_room] = status
             else:
                 # Failure is terminal for the current room generation. The
@@ -287,10 +291,19 @@ class CommonKVManager(BaseKVManager):
         with self._get_request_status_lock():
             self.request_status.pop(bootstrap_room, None)
             getattr(self, "_metadata_ready_rooms", set()).discard(bootstrap_room)
+            tombstones = getattr(self, "_cleared_room_tombstones", None)
+            if tombstones is None:
+                tombstones = set()
+                self._cleared_room_tombstones = tombstones
+            tombstones.add(bootstrap_room)
 
     def mark_metadata_ready(self, bootstrap_room: int) -> None:
         """Record completed destination metadata and advance an existing room."""
         with self._get_request_status_lock():
+            if bootstrap_room in getattr(
+                self, "_cleared_room_tombstones", set()
+            ):
+                return
             ready_rooms = getattr(self, "_metadata_ready_rooms", None)
             if ready_rooms is None:
                 ready_rooms = set()
