@@ -1476,6 +1476,38 @@ class TestWatermarkDelivery(unittest.TestCase):
         self.assertEqual(sent[0][1:3], [b"4", b"256"])
         self.assertFalse(handler._pending_watermarks)
 
+    def test_a_backpressured_rank_does_not_block_later_ranks(self):
+        sent = []
+
+        class Socket:
+            def __init__(self, rank):
+                self.rank = rank
+
+            def send_multipart(self, parts, flags=0):
+                if self.rank == 0:
+                    raise zmq.Again()
+                sent.append((self.rank, parts))
+
+        handler = self._handler(Socket(0))
+        receiver, _session_id = next(iter(handler._wm_subscribers.values()))
+        receiver.bootstrap_infos = [{"rank": 0}, {"rank": 1}]
+        receiver._connect_to_bootstrap_server = lambda info: (
+            Socket(info["rank"]),
+            threading.Lock(),
+        )
+
+        handler._free_and_send_watermark(1)
+
+        self.assertEqual(
+            [rank for rank, _parts in sent],
+            [1],
+            "a blocked rank must not starve healthy ranks",
+        )
+        self.assertTrue(
+            handler._pending_watermarks,
+            "the subscriber must remain pending until every rank succeeds",
+        )
+
     def test_retry_is_free_when_nothing_is_pending(self):
         sent = []
 

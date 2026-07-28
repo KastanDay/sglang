@@ -439,8 +439,9 @@ class DecodeStagingHandler:
         for key in tuple(self._pending_watermarks):
             receiver, session_id = self._wm_subscribers[key]
             sid_b = session_id.encode("ascii")
-            try:
-                for bootstrap_info in receiver.bootstrap_infos:
+            delivered = True
+            for bootstrap_info in receiver.bootstrap_infos:
+                try:
                     # Reached from the scheduler loop over sockets that set no
                     # send timeout, so it must never wait for a peer.
                     sock, lock = receiver._connect_to_bootstrap_server(bootstrap_info)
@@ -448,9 +449,14 @@ class DecodeStagingHandler:
                         sock.send_multipart(
                             [b"WATERMARK", wm_round_b, wm_tail_b, sid_b], zmq.NOBLOCK
                         )
-            except Exception:
-                continue
-            self._pending_watermarks.discard(key)
+                except Exception:
+                    # A receiver may contain one endpoint per prefill rank. Keep
+                    # trying later endpoints even when one rank is backpressured,
+                    # and retain the subscriber until every rank has received the
+                    # latest cumulative watermark.
+                    delivered = False
+            if delivered:
+                self._pending_watermarks.discard(key)
 
 
 def is_watermark_ready(
