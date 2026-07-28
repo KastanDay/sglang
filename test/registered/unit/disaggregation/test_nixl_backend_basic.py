@@ -518,7 +518,7 @@ class TestNixlNotifications(CustomTestCase):
         mgr.agent = NotificationFakeAgent(messages)
         rooms = {int(message.split("_", 1)[0]) for message in messages}
         mgr.request_status = {room: KVPoll.WaitingForInput for room in rooms}
-        mgr._room_request_ids = {}
+        mgr._room_request_ids = {room: "" for room in rooms}
         mgr.transfer_statuses = defaultdict(TransferStatus)
         mgr.required_prefill_response_num_table = required or {}
         mgr.enable_staging = False
