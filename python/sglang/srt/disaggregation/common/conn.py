@@ -249,11 +249,11 @@ class CommonKVManager(BaseKVManager):
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
         if bootstrap_room not in self.request_status:
-            # Do not resurrect a cleared entry with Failed: once clear() has
-            # popped the room from request_status, any late update_status(Failed)
-            # (e.g. from abort()) must be a no-op. Otherwise a Failed entry could
-            # pollute a future request that reuses the same bootstrap_room.
-            if status == KVPoll.Failed:
+            # Only the synchronous room-initialization transition may create an
+            # entry. All later transitions can arrive from background workers,
+            # so accepting one after clear() would resurrect the old generation
+            # and could make an exact bootstrap_room reuse inherit stale state.
+            if status != KVPoll.Bootstrapping:
                 return
             self.request_status[bootstrap_room] = status
         else:
@@ -1004,6 +1004,7 @@ class CommonKVSender(BaseKVSender):
         self.init_time: Optional[float] = None
         if self.kv_mgr.is_dummy_cp_rank:
             # Non-authoritative CP ranks are dummy participants.
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
             return
 

@@ -420,9 +420,8 @@ class MoriKVManager(CommonKVManager):
         current = self.request_status.get(bootstrap_room)
         if current is None:
             # Room not yet created or already cleared.
-            # Only allow initial creation: Bootstrapping (normal) or
-            # WaitingForInput (dummy CP rank, see CommonKVSender.__init__).
-            if status not in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
+            # Only allow the synchronous room-initialization transition.
+            if status != KVPoll.Bootstrapping:
                 return
         elif current == KVPoll.Failed and status != KVPoll.Failed:
             # Failed is terminal — never overwrite with non-Failed.
