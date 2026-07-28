@@ -25,6 +25,7 @@ class TransferKVChunk:
     prefill_aux_index: Optional[int]
     state_indices: Optional[List]
     chunk_id: Optional[int] = None
+    request_id: Optional[str] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
     )
@@ -34,7 +35,7 @@ def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
     if not buffers:
         return b""
     n = len(buffers)
-    header = struct.pack(f"<{n+1}I", n, *(len(b) for b in buffers))
+    header = struct.pack(f"<{n + 1}I", n, *(len(b) for b in buffers))
     return header + b"".join(buffers)
 
 
@@ -58,7 +59,7 @@ def pack_int_lists(lists, fmt: str) -> bytes:
 def unpack_int_lists(buf: bytes, fmt: str) -> List[List[int]]:
     width = struct.calcsize(fmt)
     return [
-        list(struct.unpack(f"<{len(b)//width}{fmt}", b))
+        list(struct.unpack(f"<{len(b) // width}{fmt}", b))
         for b in unpack_list_of_buffers(buf)
     ]
 

@@ -516,6 +516,9 @@ class TestNixlNotifications(CustomTestCase):
     def _make_manager(self, messages, required=None):
         mgr = object.__new__(NixlKVManager)
         mgr.agent = NotificationFakeAgent(messages)
+        rooms = {int(message.split("_", 1)[0]) for message in messages}
+        mgr.request_status = {room: KVPoll.WaitingForInput for room in rooms}
+        mgr._room_request_ids = {}
         mgr.transfer_statuses = defaultdict(TransferStatus)
         mgr.required_prefill_response_num_table = required or {}
         mgr.enable_staging = False
@@ -568,6 +571,23 @@ class TestNixlNotifications(CustomTestCase):
         mgr.update_transfer_status()
 
         self.assertTrue(mgr.transfer_statuses[8].is_done())
+
+    def test_notification_generation_must_match_reused_room(self):
+        old_token = "old".encode("utf-8").hex()
+        new_token = "new".encode("utf-8").hex()
+        mgr = self._make_manager(
+            [
+                f"9_g{old_token}_kv_0_1_0",
+                f"9_g{new_token}_kv_1_1_0",
+            ]
+        )
+        mgr._room_request_ids[9] = "new"
+
+        mgr.update_transfer_status()
+
+        status = mgr.transfer_statuses[9]
+        self.assertEqual(status.received_kvs_per_pp[0], {1})
+        self.assertEqual(status.expected_kvs_per_pp[0], 2)
 
 
 class TestNixlReceiverPoll(CustomTestCase):
