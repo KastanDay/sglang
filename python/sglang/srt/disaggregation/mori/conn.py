@@ -124,6 +124,7 @@ class TransferInfo:
     # populate this field (older receiver or radix-cache feature off) -> treat
     # as 0 (no prefix hit, full send) for backward compatibility.
     decode_prefix_len: Optional[int] = None
+    request_id: Optional[str] = None
 
     @classmethod
     def from_zmq(cls, payload: List[bytes]) -> TransferInfo:
@@ -155,6 +156,11 @@ class TransferInfo:
             decode_prefix_len: Optional[int] = int(payload[8].decode("ascii"))
         else:
             decode_prefix_len = None
+        request_id = (
+            payload[9].decode("utf-8")
+            if len(payload) > 9 and payload[9]
+            else None
+        )
 
         # A transfer is "dummy" only when the receiver does not need any
         # kv/aux/state delivered. When decode_prefix_len > 0 and the delta is
@@ -174,6 +180,7 @@ class TransferInfo:
             required_dst_info_num=required_dst_info_num,
             is_dummy=is_dummy,
             decode_prefix_len=decode_prefix_len,
+            request_id=request_id,
         )
 
 
@@ -506,7 +513,11 @@ class MoriKVManager(CommonKVManager):
                 infos = self.transfer_infos.setdefault(transfer_info.room, {})
                 infos[transfer_info.engine_key] = transfer_info
 
-                if len(infos) >= transfer_info.required_dst_info_num:
+                request_ids = {info.request_id for info in infos.values()}
+                if (
+                    len(infos) >= transfer_info.required_dst_info_num
+                    and len(request_ids) == 1
+                ):
                     self.resolve_kv_replica_factor(infos)
                     # All decode peers reported their dst metadata; pick a
                     # non-None decode_prefix_len if any peer set it (they
@@ -539,7 +550,9 @@ class MoriKVManager(CommonKVManager):
                             transfer_info.room,
                             len(infos),
                         )
-                    self.update_status(transfer_info.room, KVPoll.WaitingForInput)
+                    self.mark_metadata_ready(
+                        transfer_info.room, next(iter(request_ids))
+                    )
         except Exception:
             logger.exception("Failed to parse transfer info message")
 
@@ -1395,6 +1408,7 @@ class MoriKVSender(CommonKVSender):
         dest_tp_ranks: List[int],
         pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
+        request_id: Optional[str] = None,
     ):
         super().__init__(
             mgr,
@@ -1403,6 +1417,7 @@ class MoriKVSender(CommonKVSender):
             dest_tp_ranks,
             pp_rank,
             req_has_disagg_prefill_dp_rank,
+            request_id,
         )
         self.transfer_statuses: List[TransferStatus] = []
         self.pending_infos: Optional[List[TransferInfo]] = None
@@ -1645,8 +1660,9 @@ class MoriKVReceiver(CommonKVReceiver):
         mgr: MoriKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
+        request_id: Optional[str] = None,
     ):
-        super().__init__(mgr, bootstrap_addr, bootstrap_room)
+        super().__init__(mgr, bootstrap_addr, bootstrap_room, request_id)
         self.init_time: Optional[float] = None
 
     def init(
@@ -1740,6 +1756,7 @@ class MoriKVReceiver(CommonKVReceiver):
                         state_bytes,
                         str(self.required_dst_info_num).encode("ascii"),
                         decode_prefix_bytes,
+                        (self.request_id or "").encode("utf-8"),
                     ]
                 )
         self.init_time = time.time()

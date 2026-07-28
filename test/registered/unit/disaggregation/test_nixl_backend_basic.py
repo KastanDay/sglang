@@ -120,6 +120,7 @@ class TestNixlTransferInfo(CustomTestCase):
             b"2",
             pack_int_lists(state_indices, "i"),
             b"11",
+            b"req-7",
         ]
 
         info = TransferInfo.from_zmq(msg)
@@ -133,6 +134,7 @@ class TestNixlTransferInfo(CustomTestCase):
         self.assertEqual(info.required_dst_info_num, 2)
         self.assertEqual(info.dst_state_indices, state_indices)
         self.assertEqual(info.decode_prefix_len, 11)
+        self.assertEqual(info.request_id, "req-7")
 
     def test_from_zmq_defaults_optional_fields(self):
         info = TransferInfo.from_zmq(
@@ -149,6 +151,7 @@ class TestNixlTransferInfo(CustomTestCase):
 
         self.assertEqual(info.dst_state_indices, [])
         self.assertIsNone(info.decode_prefix_len)
+        self.assertIsNone(info.request_id)
 
     def test_decode_radix_full_hit_is_not_dummy(self):
         info = TransferInfo.from_zmq(

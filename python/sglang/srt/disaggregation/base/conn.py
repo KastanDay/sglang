@@ -117,6 +117,7 @@ class BaseKVSender(ABC):
         dest_tp_ranks: List[int],
         pp_rank: int,
         req_has_disagg_prefill_dp_rank: bool = False,
+        request_id: Optional[str] = None,
     ): ...
 
     @abstractmethod
@@ -182,6 +183,7 @@ class BaseKVReceiver(ABC):
         mgr: BaseKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
+        request_id: Optional[str] = None,
     ): ...
 
     @abstractmethod

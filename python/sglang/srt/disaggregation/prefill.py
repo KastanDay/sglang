@@ -271,6 +271,7 @@ class PrefillBootstrapQueue:
             dest_tp_ranks=dest_tp_ranks,
             pp_rank=self.pp_rank,
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
+            request_id=req.rid,
         )
         self._process_req(req)
         req.pending_bootstrap = True

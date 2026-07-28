@@ -38,9 +38,12 @@ class TestCommonKVStatus(unittest.TestCase):
     def test_late_success_after_clear_does_not_resurrect_room(self):
         manager = self._manager()
         manager.is_dummy_cp_rank = True
-        sender = CommonKVSender(manager, "127.0.0.1:30000", 7, [], 0)
+        sender = CommonKVSender(
+            manager, "127.0.0.1:30000", 7, [], 0, request_id="old"
+        )
 
         sender.clear()
+        manager.mark_metadata_ready(7, "old")
 
         for late_status in (
             KVPoll.Transferring,
@@ -53,7 +56,9 @@ class TestCommonKVStatus(unittest.TestCase):
 
         manager.is_dummy_cp_rank = False
         manager.server_args = SimpleNamespace(dp_size=1)
-        CommonKVSender(manager, "127.0.0.1:30000", 7, [], 0)
+        CommonKVSender(
+            manager, "127.0.0.1:30000", 7, [], 0, request_id="new"
+        )
         self.assertEqual(manager.request_status[7], KVPoll.Bootstrapping)
 
     def test_dummy_cp_rank_initializes_waiting(self):
@@ -68,11 +73,48 @@ class TestCommonKVStatus(unittest.TestCase):
         manager = self._manager()
         manager.is_dummy_cp_rank = False
         manager.server_args = SimpleNamespace(dp_size=1)
-        manager.update_status(7, KVPoll.WaitingForInput)
+        manager.mark_metadata_ready(7, "new")
 
-        CommonKVSender(manager, "127.0.0.1:30000", 7, [], 0)
+        CommonKVSender(
+            manager, "127.0.0.1:30000", 7, [], 0, request_id="new"
+        )
 
         self.assertEqual(manager.request_status[7], KVPoll.WaitingForInput)
+
+    def test_reused_room_accepts_only_new_generation_metadata(self):
+        manager = self._manager()
+        manager.is_dummy_cp_rank = True
+        sender = CommonKVSender(
+            manager, "127.0.0.1:30000", 7, [], 0, request_id="old"
+        )
+        sender.clear()
+
+        manager.mark_metadata_ready(7, "old")
+        manager.mark_metadata_ready(7, "new")
+        manager.is_dummy_cp_rank = False
+        manager.server_args = SimpleNamespace(dp_size=1)
+        CommonKVSender(
+            manager, "127.0.0.1:30000", 7, [], 0, request_id="new"
+        )
+
+        self.assertEqual(manager.request_status[7], KVPoll.WaitingForInput)
+
+    def test_old_sender_cannot_clear_reused_room(self):
+        manager = self._manager()
+        manager.is_dummy_cp_rank = True
+        old_sender = CommonKVSender(
+            manager, "127.0.0.1:30000", 7, [], 0, request_id="old"
+        )
+        old_sender.clear()
+
+        manager.is_dummy_cp_rank = False
+        manager.server_args = SimpleNamespace(dp_size=1)
+        CommonKVSender(
+            manager, "127.0.0.1:30000", 7, [], 0, request_id="new"
+        )
+        old_sender.clear()
+
+        self.assertEqual(manager.request_status[7], KVPoll.Bootstrapping)
 
     def test_concurrent_success_cannot_overwrite_failure(self):
         manager = self._manager(KVPoll.WaitingForInput)
