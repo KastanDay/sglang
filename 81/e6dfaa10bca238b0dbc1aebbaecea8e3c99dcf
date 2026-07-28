@@ -1,0 +1,21 @@
+python/sglang/srt/disaggregation/common/staging_handler.py
+  s_8a7958e6359071::t_150fdd2b9c6776 442-444,452-459
+test/registered/unit/disaggregation/test_transfer_ownership_barrier.py
+  s_8a7958e6359071::t_60c53c768dfa72 1479-1510
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "81e6dfaa10bca238b0dbc1aebbaecea8e3c99dcf",
+  "prompts": {},
+  "sessions": {
+    "s_8a7958e6359071": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fa9f5-a5e1-75a0-b9c2-aa193402a992",
+        "model": "unknown"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    }
+  }
+}
