@@ -45,7 +45,8 @@ from sglang.srt.disaggregation.common.utils import (
     submit_transfer_calls,
     unpack_int_lists,
 )
-from sglang.srt.disaggregation.mooncake.room_lifetime import (
+from sglang.srt.disaggregation.mooncake.transfer_barrier import (
+    PeerAckBarrier,
     RoomLifetimeRegistry,
     RoomTransferLifetime,
 )
@@ -2494,16 +2495,12 @@ class MooncakeKVReceiver(CommonKVReceiver):
         self.init_time = None
         # Ownership barrier state. Only meaningful once send_metadata() has told
         # a prefill rank where to write: before that no peer can touch our pages.
-        self._metadata_sent = False
+        self._ack_barrier = PeerAckBarrier()
         self._quiescing = False
         self._quiesce_complete = False
         self._quiesce_deadline = float("inf")
-        self._abort_targets: List[Tuple[dict, bytes]] = []
-        self._expected_abort_acks: set = set()
-        self._received_abort_acks: set = set()
-        self._peer_lacks_barrier = False
+        # Abort resend throttle; only the scheduler loop reads or writes it.
         self._last_abort_send = float("-inf")
-        self._abort_lock = threading.Lock()
         # Per-room state (ABORT_ACK routing, status, staging teardown) may only
         # be touched by the receiver that owns the room. A second live receiver
         # for the same bootstrap_room means the room numbers collided upstream:
@@ -2625,7 +2622,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 self.bootstrap_room, self.bootstrap_infos, self
             )
 
-        for bootstrap_info, abort_token in self._abort_targets_snapshot():
+        for bootstrap_info, abort_token in self._ack_barrier.mint_targets(
+            self.bootstrap_infos
+        ):
             is_dummy = bootstrap_info["is_dummy"]
             parts = [
                 str(self.bootstrap_room).encode("ascii"),
@@ -2647,17 +2646,17 @@ class MooncakeKVReceiver(CommonKVReceiver):
             # send cannot receive and discard an early ACK. ZeroMQ delivers
             # multipart messages atomically, so a send that raises exposed no
             # complete metadata and the exposure is withdrawn.
-            self._record_metadata_exposure(abort_token)
+            self._ack_barrier.expose(abort_token)
             try:
                 self._send_to_prefill(bootstrap_info, parts)
             except zmq.ZMQError:
-                self._discard_metadata_exposure(abort_token)
+                self._ack_barrier.withdraw(abort_token)
                 self._conclude_failed(
                     f"send_metadata to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
                 )
                 return
             except Exception:
-                self._discard_metadata_exposure(abort_token)
+                self._ack_barrier.withdraw(abort_token)
                 raise
         self.init_time = time.time()
 
@@ -2706,7 +2705,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
 
     def advance_failure_quiescence(self) -> bool:
         self._close_barrier()
-        if self._quiesce_complete or not self._metadata_sent:
+        if self._quiesce_complete or not self._ack_barrier.any_exposed():
             # No prefill rank was ever handed this request's page indices, so
             # nothing can be writing into them. In particular a receiver that
             # lost its room never sends metadata, so it always concludes here.
@@ -2720,9 +2719,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
             return True
         if time.monotonic() < self._quiesce_deadline:
             return False
-        with self._abort_lock:
-            missing = len(self._expected_abort_acks - self._received_abort_acks)
-            total = len(self._expected_abort_acks)
+        missing, total = self._ack_barrier.missing_acks()
         return self._conclude_without_proof(
             f"{missing} of {total} prefill ranks unacknowledged after "
             f"{self.kv_mgr.quiesce_timeout:.1f}s"
@@ -2736,87 +2733,39 @@ class MooncakeKVReceiver(CommonKVReceiver):
 
     def _peers_quiesced(self) -> bool:
         self._send_abort_notification()
-        with self._abort_lock:
-            if self._peer_lacks_barrier:
-                # A peer that acknowledges without echoing a nonce does so before
-                # its transfers drain, so its ACK is not proof. WARN may credit
-                # that compatibility exception to one peer, but it must still
-                # receive every other peer's token. Tokenless ACKs carry no source
-                # identity and may be retries, so crediting more than one would
-                # let duplicates impersonate token-aware peers. STRICT cannot
-                # accept any proof-less peer.
-                return (
-                    self.kv_mgr.transfer_barrier != TransferBarrierLevel.STRICT
-                    and len(self._received_abort_acks) + 1
-                    >= len(self._expected_abort_acks)
-                )
-            return self._expected_abort_acks <= self._received_abort_acks
-
-    def _abort_targets_snapshot(self) -> List[Tuple[dict, bytes]]:
-        """Per-peer abort nonces, minted once and reused across retries.
-
-        One nonce per prefill rank lets an ABORT_ACK identify *which* peer has
-        drained, and prevents a stale ACK for a recycled room from satisfying
-        this request.
-        """
-        with self._abort_lock:
-            if not self._abort_targets and self.bootstrap_infos:
-                self._abort_targets = [
-                    (bootstrap_info, os.urandom(16).hex().encode("ascii"))
-                    for bootstrap_info in self.bootstrap_infos
-                ]
-            return list(self._abort_targets)
-
-    def _record_metadata_exposure(self, token: bytes) -> None:
-        """Require an ACK from a peer that may now write into this room."""
-        with self._abort_lock:
-            self._expected_abort_acks.add(token)
-            self._metadata_sent = True
-
-    def _discard_metadata_exposure(self, token: bytes) -> None:
-        """Undo an exposure whose atomic multipart send did not complete."""
-        with self._abort_lock:
-            self._expected_abort_acks.discard(token)
-            self._received_abort_acks.discard(token)
-            self._metadata_sent = bool(self._expected_abort_acks)
+        # A tokenless ACK is never proof (see PeerAckBarrier.quiesced); WARN may
+        # credit it once for a rolling upgrade, STRICT never releases without
+        # proof.
+        return self._ack_barrier.quiesced(
+            credit_one_tokenless=self.kv_mgr.transfer_barrier
+            != TransferBarrierLevel.STRICT
+        )
 
     def record_abort_ack(self, token: Optional[bytes]) -> None:
-        with self._abort_lock:
-            if not token:
-                # A prefill that predates the ownership barrier acknowledges the
-                # notification without echoing a nonce, and does so before its
-                # transfers have drained. It cannot promise quiescence. WARN can
-                # credit one such compatibility exception while still waiting
-                # for every token-aware peer; STRICT waits for proof or escalates.
-                self._peer_lacks_barrier = True
-                logger.warning_once(
-                    "Prefill peer acknowledged an abort without a transfer-quiescence "
-                    "token, so it acknowledges before its transfers drain and cannot "
-                    "prove quiescence. Upgrade the prefill instances; WARN will still "
-                    "wait for every token-aware peer before crediting one legacy peer, "
-                    "and STRICT will refuse to release without proof."
-                )
-                return
-            if token in self._expected_abort_acks:
-                self._received_abort_acks.add(token)
+        if self._ack_barrier.record_ack(token):
+            # A prefill that predates the ownership barrier acknowledges the
+            # notification without echoing a nonce, and does so before its
+            # transfers have drained. It cannot promise quiescence. WARN can
+            # credit one such compatibility exception while still waiting
+            # for every token-aware peer; STRICT waits for proof or escalates.
+            logger.warning_once(
+                "Prefill peer acknowledged an abort without a transfer-quiescence "
+                "token, so it acknowledges before its transfers drain and cannot "
+                "prove quiescence. Upgrade the prefill instances; WARN will still "
+                "wait for every token-aware peer before crediting one legacy peer, "
+                "and STRICT will refuse to release without proof."
+            )
 
     def _send_abort_notification(self):
         """(Re-)notify prefill ranks that have not acknowledged the abort."""
-        targets = self._abort_targets_snapshot()
-        if not targets:
+        if not self._ack_barrier.mint_targets(self.bootstrap_infos):
             return
         now = time.monotonic()
-        with self._abort_lock:
-            if now - self._last_abort_send < ABORT_RETRY_INTERVAL_S:
-                return
-            self._last_abort_send = now
-            targets = [
-                (info, token)
-                for info, token in targets
-                if token not in self._received_abort_acks
-            ]
+        if now - self._last_abort_send < ABORT_RETRY_INTERVAL_S:
+            return
+        self._last_abort_send = now
 
-        for bootstrap_info, token in targets:
+        for bootstrap_info, token in self._ack_barrier.unacked_targets():
             # Best-effort notification to prefill side that this request was
             # aborted. This runs on the scheduler loop, and these sockets have no
             # send timeout, so it must never wait for a peer: zmq.NOBLOCK turns a
@@ -2836,8 +2785,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 )
             except zmq.Again:
                 # Retried by the next _send_abort_notification() tick.
-                with self._abort_lock:
-                    self._last_abort_send = float("-inf")
+                self._last_abort_send = float("-inf")
             except Exception as e:
                 logger.debug(
                     "Failed to send abort notification for room %s: %s",

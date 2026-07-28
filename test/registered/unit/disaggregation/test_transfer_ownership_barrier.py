@@ -38,8 +38,9 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVSender,
     TransferInfo,
 )
-from sglang.srt.disaggregation.mooncake.room_lifetime import (
+from sglang.srt.disaggregation.mooncake.transfer_barrier import (
     MAX_EMERGENCY_SCAN,
+    PeerAckBarrier,
     RoomLifetimeRegistry,
     RoomTransferLifetime,
 )
@@ -120,27 +121,18 @@ def make_receiver(mgr, room=ROOM, bootstrap_infos=None, metadata_sent=True):
     receiver.conclude_state = None
     receiver.require_staging = False
     receiver.bootstrap_infos = bootstrap_infos
-    receiver._metadata_sent = False
+    receiver._ack_barrier = PeerAckBarrier()
     receiver._quiescing = False
     receiver._quiesce_complete = False
     receiver._quiesce_deadline = float("inf")
-    receiver._abort_targets = []
-    receiver._expected_abort_acks = set()
-    receiver._received_abort_acks = set()
-    receiver._peer_lacks_barrier = False
     receiver._last_abort_send = float("-inf")
     receiver._owns_room = True
-    receiver._abort_lock = threading.Lock()
     receiver._connect_to_bootstrap_server = Mock(
         side_effect=lambda info: (Mock(), threading.Lock())
     )
     if metadata_sent:
-        targets = receiver._abort_targets_snapshot()
-        if targets:
-            for _info, token in targets:
-                receiver._record_metadata_exposure(token)
-        else:
-            receiver._metadata_sent = True
+        for _info, token in receiver._ack_barrier.mint_targets(bootstrap_infos):
+            receiver._ack_barrier.expose(token)
     return receiver
 
 
@@ -555,7 +547,7 @@ class TestPrefillOwnership(unittest.TestCase):
         mgr.open_room_transfers(-1)
         self.assertTrue(live.try_lease())
         with patch(
-            "sglang.srt.disaggregation.mooncake.room_lifetime.MAX_TRACKED_ROOMS", 4
+            "sglang.srt.disaggregation.mooncake.transfer_barrier.MAX_TRACKED_ROOMS", 4
         ):
             for room in range(200):
                 mgr._close_room_for_abort(room, b"").created_at = 0
@@ -575,7 +567,7 @@ class TestPrefillOwnership(unittest.TestCase):
         # O(tracked rooms) on the bootstrap thread.
         mgr = make_prefill_manager()
         with patch(
-            "sglang.srt.disaggregation.mooncake.room_lifetime.MAX_TRACKED_ROOMS", 8
+            "sglang.srt.disaggregation.mooncake.transfer_barrier.MAX_TRACKED_ROOMS", 8
         ):
             for room in range(400):
                 lifetime = mgr._room_registry.get_or_create(room)
@@ -908,7 +900,7 @@ class TestStagingComposition(unittest.TestCase):
             receiver.advance_failure_quiescence(),
             "the request must not go terminal, so unregister_decode_req cannot run",
         )
-        receiver.record_abort_ack(next(iter(receiver._expected_abort_acks)))
+        receiver.record_abort_ack(receiver._ack_barrier.unacked_targets()[0][1])
         self.assertTrue(receiver.advance_failure_quiescence())
 
     def test_watermark_broadcast_never_blocks_the_scheduler_loop(self):
@@ -953,7 +945,9 @@ class TestDecodeOwnership(unittest.TestCase):
         receiver = make_receiver(mgr, bootstrap_infos=[{"rank": 0}, {"rank": 1}])
 
         self.assertFalse(receiver.advance_failure_quiescence())
-        tokens = sorted(receiver._expected_abort_acks)
+        tokens = sorted(
+            token for _info, token in receiver._ack_barrier.unacked_targets()
+        )
         self.assertEqual(len(tokens), 2, "one nonce per prefill rank")
 
         receiver.record_abort_ack(tokens[0])
@@ -1023,12 +1017,17 @@ class TestDecodeOwnership(unittest.TestCase):
         receiver._connect_to_bootstrap_server = connect
         receiver.send_metadata(np.array([123], dtype=np.int32))
 
-        tokens = {info["rank"]: token for info, token in receiver._abort_targets}
+        tokens = {
+            info["rank"]: token
+            for info, token in receiver._ack_barrier.mint_targets(
+                receiver.bootstrap_infos
+            )
+        }
         self.assertEqual(connected, [0, 1])
-        self.assertEqual(receiver._expected_abort_acks, {tokens[0]})
-        self.assertTrue(receiver._metadata_sent)
-        self.assertNotIn(tokens[1], receiver._expected_abort_acks)
-        self.assertNotIn(tokens[2], receiver._expected_abort_acks)
+        self.assertEqual(receiver._ack_barrier._exposed, {tokens[0]})
+        self.assertTrue(receiver._ack_barrier.any_exposed())
+        self.assertNotIn(tokens[1], receiver._ack_barrier._exposed)
+        self.assertNotIn(tokens[2], receiver._ack_barrier._exposed)
 
     def test_quiescence_is_bounded_when_a_peer_never_acknowledges(self):
         mgr = make_decode_manager(quiesce_timeout=0.05)
@@ -1061,7 +1060,12 @@ class TestDecodeOwnership(unittest.TestCase):
             mgr, bootstrap_infos=[{"rank": "legacy"}, {"rank": "current"}]
         )
         self.assertFalse(receiver.advance_failure_quiescence())
-        tokens = {info["rank"]: token for info, token in receiver._abort_targets}
+        tokens = {
+            info["rank"]: token
+            for info, token in receiver._ack_barrier.mint_targets(
+                receiver.bootstrap_infos
+            )
+        }
 
         receiver.record_abort_ack(None)
         self.assertFalse(
@@ -1318,7 +1322,7 @@ class TestRoomStateRetirement(unittest.TestCase):
         self.assertIn(ROOM, mgr.transfer_infos)
         mgr._room_registry.get(ROOM).created_at = 0
         with patch(
-            "sglang.srt.disaggregation.mooncake.room_lifetime.MAX_TRACKED_ROOMS", 1
+            "sglang.srt.disaggregation.mooncake.transfer_barrier.MAX_TRACKED_ROOMS", 1
         ):
             mgr._room_registry.get_or_create(ROOM + 1)
         self.assertNotIn(ROOM, mgr._room_registry.rooms())
@@ -1331,7 +1335,7 @@ class TestRoomStateRetirement(unittest.TestCase):
         self._room_with_metadata(mgr)
 
         with patch(
-            "sglang.srt.disaggregation.mooncake.room_lifetime.MAX_TRACKED_ROOMS", 1
+            "sglang.srt.disaggregation.mooncake.transfer_barrier.MAX_TRACKED_ROOMS", 1
         ):
             mgr._room_registry.get_or_create(ROOM + 1)
 

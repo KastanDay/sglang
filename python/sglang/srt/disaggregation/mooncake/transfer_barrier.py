@@ -1,19 +1,26 @@
-"""Room lifetime tracking for the Mooncake KV transfer ownership barrier.
+"""Primitives for the Mooncake KV transfer ownership barrier.
 
 A *bootstrap room* names one request's KV handoff from a prefill rank to its
-decode peers. :class:`RoomTransferLifetime` is the ownership barrier for one
-room's KV pages; :class:`RoomLifetimeRegistry` tracks every lifetime on a
-prefill rank and reclaims the ones no local sender will ever release.
+decode peers. The barrier keeps a failed request's KV pages allocated until no
+transfer work can still touch them, and each side of the transfer tracks that
+differently:
+
+* prefill owns the *source* pages and counts local transfer leases --
+  :class:`RoomTransferLifetime`, tracked and reclaimed per room by
+  :class:`RoomLifetimeRegistry`;
+* decode owns the *destination* pages and counts peer acknowledgements --
+  :class:`PeerAckBarrier`.
 """
 
 from __future__ import annotations
 
 import itertools
 import logging
+import os
 import threading
 import time
 from collections import OrderedDict
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -232,3 +239,96 @@ class RoomLifetimeRegistry:
             del self._rooms[room]
             self._on_retire(room)
         return len(stale)
+
+
+class PeerAckBarrier:
+    """Which prefill peers may write into one room's KV pages, and which have
+    proven they stopped.
+
+    Decode-side counterpart of :class:`RoomTransferLifetime`: that one counts
+    local transfer leases on the prefill rank, this one counts peer
+    acknowledgements on the decode rank, whose pages are the *destination* of
+    the prefill's RDMA writes.
+
+    Each peer gets a one-off token, minted together with its abort target. A
+    peer is *exposed* immediately before the metadata naming our pages is sent
+    to it, and its write ownership ends only when it echoes that token in an
+    ABORT_ACK -- which it sends after draining its transfer work. A tokenless
+    ACK comes from a peer that predates the token protocol and acknowledges
+    *before* draining; it is recorded, but it is never proof.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._targets: List[Tuple[dict, bytes]] = []
+        self._exposed: set = set()
+        self._acked: set = set()
+        self._tokenless_peer_acked = False
+
+    def mint_targets(self, bootstrap_infos) -> List[Tuple[dict, bytes]]:
+        """Per-peer abort nonces, minted once and reused across retries.
+
+        One nonce per prefill rank lets an ABORT_ACK identify *which* peer has
+        drained, and prevents a stale ACK for a recycled room from satisfying
+        this request.
+        """
+        with self._lock:
+            if not self._targets and bootstrap_infos:
+                self._targets = [
+                    (bootstrap_info, os.urandom(16).hex().encode("ascii"))
+                    for bootstrap_info in bootstrap_infos
+                ]
+            return list(self._targets)
+
+    def expose(self, token: bytes) -> None:
+        """Require an ACK from a peer that may now write into our pages."""
+        with self._lock:
+            self._exposed.add(token)
+
+    def withdraw(self, token: bytes) -> None:
+        """Undo an exposure whose atomic metadata send did not complete."""
+        with self._lock:
+            self._exposed.discard(token)
+            self._acked.discard(token)
+
+    def any_exposed(self) -> bool:
+        with self._lock:
+            return bool(self._exposed)
+
+    def record_ack(self, token: Optional[bytes]) -> bool:
+        """Record one ABORT_ACK. Returns True if it was tokenless."""
+        with self._lock:
+            if not token:
+                self._tokenless_peer_acked = True
+                return True
+            if token in self._exposed:
+                self._acked.add(token)
+            return False
+
+    def unacked_targets(self) -> List[Tuple[dict, bytes]]:
+        with self._lock:
+            return [
+                (info, token)
+                for info, token in self._targets
+                if token not in self._acked
+            ]
+
+    def missing_acks(self) -> Tuple[int, int]:
+        """(unacknowledged, total) exposed peers, for diagnostics."""
+        with self._lock:
+            return len(self._exposed - self._acked), len(self._exposed)
+
+    def quiesced(self, credit_one_tokenless: bool) -> bool:
+        """Whether every peer that saw our page indices has proven it stopped.
+
+        A tokenless ACK carries no source identity and may be a retry, so at
+        most *one* such peer can ever be credited -- crediting more would let
+        duplicates impersonate token-aware peers -- and only when the caller
+        allows proof-less release at all (WARN, never STRICT).
+        """
+        with self._lock:
+            if self._tokenless_peer_acked:
+                return credit_one_tokenless and len(self._acked) + 1 >= len(
+                    self._exposed
+                )
+            return self._exposed <= self._acked
