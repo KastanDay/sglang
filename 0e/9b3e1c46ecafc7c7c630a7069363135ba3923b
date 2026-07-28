@@ -1,0 +1,37 @@
+python/sglang/srt/disaggregation/base/conn.py
+  s_43857d0b71bc75::t_1debc1d29f627e 91-94,206-209
+python/sglang/srt/disaggregation/mooncake/conn.py
+  s_6945c8c0aaacb9::t_41a6ee06a11fb4 236,606-608,610,621-622,2422,2494-2495,2497-2498,2502-2510,2728-2729,2735-2736,2740-2741
+python/sglang/srt/disaggregation/mooncake/transfer_barrier.py
+  s_6945c8c0aaacb9::t_e81f63b9be9257 319,322-323
+python/sglang/srt/disaggregation/utils.py
+  s_6945c8c0aaacb9::t_2d16e46ef053e6 153-155,161-165
+python/sglang/srt/environ.py
+  s_6945c8c0aaacb9::t_9cff10a6d32668 217-221,418-421,423-424
+test/registered/unit/disaggregation/test_transfer_ownership_barrier.py
+  s_6945c8c0aaacb9::t_1512362773f604 7-8,509,515,517-519,523-524,526,530,532,1022,1026,1028-1030,1034-1037,1039,1041,1046,1068-1071,1131,1144-1146,1148-1167,1170,1175,1200-1201,1204-1205,1247,1256-1260,1262,1264-1265,1271,1425,1438-1452
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0e9b3e1c46ecafc7c7c630a7069363135ba3923b",
+  "prompts": {},
+  "sessions": {
+    "s_43857d0b71bc75": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019faad3-54be-7102-b314-4440c170ac09",
+        "model": "unknown"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    },
+    "s_6945c8c0aaacb9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019faacb-d909-7e43-a2d3-0c67f049b8de",
+        "model": "unknown"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    }
+  }
+}
