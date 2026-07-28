@@ -675,6 +675,7 @@ def handle_staging_req(
     chunk_idx = int(msg[2].decode("ascii"))
     chunk_num_pages = int(msg[3].decode("ascii"))
     session_id = msg[4].decode("ascii")
+    request_id = msg[5] if len(msg) > 5 else b""
 
     if staging_allocator is None:
         logger.warning(
@@ -769,6 +770,7 @@ def handle_staging_req(
                             str(rnd).encode("ascii"),
                             str(end).encode("ascii"),
                             session_id.encode("ascii"),
+                            request_id,
                         ]
                     )
             except Exception:
@@ -834,6 +836,7 @@ def prefetch_staging_reqs(
                         str(chunk_idx).encode("ascii"),
                         str(chunk_pages).encode("ascii"),
                         session_id.encode("ascii"),
+                        (tinfo.request_id or "").encode("utf-8"),
                     ]
                 )
             except Exception:

@@ -34,6 +34,17 @@ def maybe_wrap_ipv6_address(address: str) -> str:
         return address
 
 
+def _ensure_shared_request_id(request: dict) -> None:
+    """Give both PD workers the same ID when the caller omitted one."""
+    if request.get("rid") is not None:
+        return
+    bootstrap_room = request["bootstrap_room"]
+    if isinstance(bootstrap_room, list):
+        request["rid"] = [f"pd-{room}" for room in bootstrap_room]
+    else:
+        request["rid"] = f"pd-{bootstrap_room}"
+
+
 class MiniLoadBalancer:
     def __init__(
         self,
@@ -381,6 +392,7 @@ async def handle_generate_request(request_data: dict):
                 "bootstrap_room": _generate_bootstrap_room(),
             }
         )
+    _ensure_shared_request_id(modified_request)
 
     if request_data.get("stream", False):
         return await lb.generate_stream(
@@ -406,6 +418,7 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
             "bootstrap_room": _generate_bootstrap_room(),
         }
     )
+    _ensure_shared_request_id(modified_request)
 
     if request_data.get("stream", False):
         return await lb.generate_stream(
