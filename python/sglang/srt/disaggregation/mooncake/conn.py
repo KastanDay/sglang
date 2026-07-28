@@ -2140,6 +2140,14 @@ class MooncakeKVReceiver(CommonKVReceiver):
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
 
+        if (
+            not self.abort_notified
+            and hasattr(self, "bootstrap_infos")
+            and self.bootstrap_infos is not None
+        ):
+            self._send_abort_notification()
+            self.abort_notified = True
+
         self.clear()
 
         with self.kv_mgr.failure_lock:

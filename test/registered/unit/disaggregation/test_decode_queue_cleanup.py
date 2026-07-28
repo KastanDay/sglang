@@ -152,7 +152,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
         queue.queue = [decode_req]
-        queue._deferred_kv_releases = []
+        queue._failed_transfer_quarantine = []
         queue.enable_staging = False
         queue.gloo_group = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
@@ -182,19 +182,11 @@ class TestDecodeQueueCleanup(CustomTestCase):
             [req], req.return_logprob
         )
         mock_prepare_abort.assert_called_once()
-        # The pages and metadata slot are in-flight write destinations, so the
-        # free is deferred for the grace period rather than immediate.
+        # The pages and metadata slot are in-flight write destinations, so they
+        # remain quarantined rather than being made available to another req.
         mock_release_kv_cache.assert_not_called()
         queue.req_to_metadata_buffer_idx_allocator.free.assert_not_called()
-        with patch(
-            "sglang.srt.disaggregation.decode.time.monotonic",
-            return_value=queue._deferred_kv_releases[0][1] + 1,
-        ):
-            queue.pop_transferred()
-        mock_release_kv_cache.assert_called_once_with(
-            req, queue.tree_cache, is_insert=False
-        )
-        queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
+        self.assertEqual(queue._failed_transfer_quarantine, [decode_req])
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):
         scheduler = Scheduler.__new__(Scheduler)
@@ -214,7 +206,35 @@ class TestDecodeQueueCleanup(CustomTestCase):
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
             queue=[], retracted_queue=[object()]
         )
-        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            queue=[], _failed_transfer_quarantine=[]
+        )
+        scheduler.decode_offload_manager = None
+        scheduler.enable_hisparse = False
+        scheduler.enable_hierarchical_cache = False
+
+        self.assertFalse(scheduler.is_fully_idle())
+
+    def test_quarantined_decode_requests_keep_scheduler_non_idle(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.running_batch = MagicMock()
+        scheduler.running_batch.is_empty.return_value = True
+        scheduler.chunked_req = None
+        scheduler.dllm_manager = MagicMock()
+        scheduler.dllm_manager.any_staging_reqs.return_value = False
+        scheduler.last_batch = None
+        scheduler.enable_overlap = False
+        scheduler.ps = ParallelState.trivial()
+        scheduler.running_mbs = []
+        scheduler.waiting_queue = []
+        scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
+            queue=[], retracted_queue=[]
+        )
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            queue=[], _failed_transfer_quarantine=[object()]
+        )
         scheduler.decode_offload_manager = None
         scheduler.enable_hisparse = False
         scheduler.enable_hierarchical_cache = False
