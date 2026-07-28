@@ -2201,7 +2201,7 @@ class NixlKVManager(CommonKVManager):
                 chunk_id=chunk_id,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
-                request_id=request_id,
+                request_id=self.wire_request_id(bootstrap_room, request_id),
             )
         )
         return None

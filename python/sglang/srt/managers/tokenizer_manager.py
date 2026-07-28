@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -145,6 +146,26 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+
+def _parallel_sample_request_id(base_rid: str, sample_index: Optional[int]) -> str:
+    """Derive the same internal RID on independently tokenizing PD workers."""
+    suffix = "cache" if sample_index is None else str(sample_index)
+    return f"{base_rid}:parallel:{suffix}"
+
+
+def _parallel_sample_bootstrap_room(
+    base_room: Optional[int], base_rid: str, sample_index: int
+) -> Optional[int]:
+    """Give every parallel sample a stable room distinct from the prefix-cache room."""
+    if base_room is None:
+        return None
+    digest = hashlib.blake2b(
+        f"{base_room}:{base_rid}:{sample_index}".encode("utf-8"),
+        digest_size=8,
+        person=b"sglang-pd",
+    ).digest()
+    return int.from_bytes(digest, "big") & ((1 << 63) - 1)
 
 
 @lru_cache(maxsize=1)
@@ -1652,7 +1673,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenized_obj.mm_inputs.mm_items = [
                         copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                     ]
-                tokenized_obj.rid = tmp_obj.regenerate_rid()
+                cache_rid = _parallel_sample_request_id(tmp_obj.rid, None)
+                tmp_obj.rid = cache_rid
+                tokenized_obj.rid = cache_rid
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
@@ -1662,7 +1685,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
+                for sample_index in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
@@ -1671,7 +1694,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         tokenized_obj.mm_inputs.mm_items = [
                             copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                         ]
-                    tokenized_obj.rid = tmp_obj.regenerate_rid()
+                    sample_rid = _parallel_sample_request_id(objs[i].rid, sample_index)
+                    tmp_obj.rid = sample_rid
+                    tokenized_obj.rid = sample_rid
+                    sample_room = _parallel_sample_bootstrap_room(
+                        objs[i].bootstrap_room, objs[i].rid, sample_index
+                    )
+                    tmp_obj.bootstrap_room = sample_room
+                    tokenized_obj.bootstrap_room = sample_room
                     self._init_req_state(tmp_obj)
                     state = self.rid_to_state[tmp_obj.rid]
                     tokenized_obj.time_stats = state.time_stats

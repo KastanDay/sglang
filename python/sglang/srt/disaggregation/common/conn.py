@@ -109,10 +109,15 @@ class PrefillServerInfo:
 class PrefillRankInfo:
     rank_ip: str
     rank_port: int
+    # This response remains a plain dict on decode workers, so old clients
+    # safely ignore the extra key while new clients can identify old peers
+    # whose response does not contain it.
+    generation_ids_supported: bool = True
 
     def __post_init__(self):
         self.rank_ip = str(self.rank_ip)
         self.rank_port = int(self.rank_port)
+        self.generation_ids_supported = bool(self.generation_ids_supported)
 
 
 class CommonKVManager(BaseKVManager):
@@ -180,6 +185,7 @@ class CommonKVManager(BaseKVManager):
         self.request_status: Dict[int, KVPoll] = {}
         self._request_status_lock = threading.RLock()
         self._room_request_ids: Dict[int, str] = {}
+        self._legacy_generation_rooms: Set[int] = set()
         self._pending_metadata_ready: Dict[int, Set[str]] = defaultdict(set)
         self._pending_metadata_ready_order: OrderedDict[Tuple[int, str], None] = (
             OrderedDict()
@@ -284,9 +290,8 @@ class CommonKVManager(BaseKVManager):
             active_request_id = getattr(self, "_room_request_ids", {}).get(
                 bootstrap_room
             )
-            if (
-                active_request_id is not None
-                and active_request_id != normalized_request_id
+            if active_request_id is not None and not self._request_id_matches_active(
+                bootstrap_room, normalized_request_id
             ):
                 return
             if bootstrap_room not in self.request_status:
@@ -314,6 +319,38 @@ class CommonKVManager(BaseKVManager):
     def _normalize_request_id(request_id: Optional[str]) -> str:
         return request_id or ""
 
+    def _request_id_matches_active(
+        self,
+        bootstrap_room: int,
+        request_id: Optional[str],
+    ) -> bool:
+        """Match tagged messages, or untagged messages from a negotiated legacy peer."""
+        request_id = self._normalize_request_id(request_id)
+        active_request_id = getattr(self, "_room_request_ids", {}).get(bootstrap_room)
+        return active_request_id == request_id or (
+            not request_id
+            and bootstrap_room in getattr(self, "_legacy_generation_rooms", set())
+        )
+
+    def allow_legacy_generation(self, bootstrap_room: int) -> None:
+        """Allow untagged messages for one active mixed-version generation."""
+        with self._get_request_status_lock():
+            if bootstrap_room in self.request_status:
+                legacy_rooms = getattr(self, "_legacy_generation_rooms", None)
+                if legacy_rooms is None:
+                    legacy_rooms = set()
+                    self._legacy_generation_rooms = legacy_rooms
+                legacy_rooms.add(bootstrap_room)
+
+    def wire_request_id(
+        self, bootstrap_room: int, request_id: Optional[str]
+    ) -> Optional[str]:
+        """Omit generation frames when sending to a negotiated legacy peer."""
+        with self._get_request_status_lock():
+            if bootstrap_room in getattr(self, "_legacy_generation_rooms", set()):
+                return None
+            return request_id
+
     def start_generation(self, bootstrap_room: int, request_id: Optional[str]) -> None:
         request_id = self._normalize_request_id(request_id)
         with self._get_request_status_lock():
@@ -325,6 +362,9 @@ class CommonKVManager(BaseKVManager):
                 request_id,
             ):
                 return
+            is_new_generation = bootstrap_room not in self.request_status
+            if is_new_generation:
+                getattr(self, "_legacy_generation_rooms", set()).discard(bootstrap_room)
 
             self.update_status(
                 bootstrap_room, KVPoll.Bootstrapping, request_id=request_id
@@ -350,6 +390,10 @@ class CommonKVManager(BaseKVManager):
                 pending_order.pop((bootstrap_room, pending_request_id), None)
             if hasattr(self, "transfer_infos"):
                 matching_infos = pending_transfer_infos.get(request_id)
+                if matching_infos is None:
+                    matching_infos = pending_transfer_infos.get("")
+                    if matching_infos is not None:
+                        self.allow_legacy_generation(bootstrap_room)
                 if matching_infos is not None:
                     self.transfer_infos[bootstrap_room] = matching_infos
                     if hasattr(self, "req_to_decode_prefix_len"):
@@ -372,7 +416,9 @@ class CommonKVManager(BaseKVManager):
             pending_ready_order = getattr(self, "_pending_metadata_ready_order", {})
             for pending_request_id in pending:
                 pending_ready_order.pop((bootstrap_room, pending_request_id), None)
-            if request_id in pending:
+            if request_id in pending or "" in pending:
+                if request_id not in pending:
+                    self.allow_legacy_generation(bootstrap_room)
                 self.update_status(
                     bootstrap_room, KVPoll.WaitingForInput, request_id=request_id
                 )
@@ -386,9 +432,11 @@ class CommonKVManager(BaseKVManager):
                 bootstrap_room
             )
             if bootstrap_room in self.request_status:
-                if active_request_id == request_id:
+                if self._request_id_matches_active(bootstrap_room, request_id):
                     self.update_status(
-                        bootstrap_room, KVPoll.WaitingForInput, request_id=request_id
+                        bootstrap_room,
+                        KVPoll.WaitingForInput,
+                        request_id=active_request_id,
                     )
                 return
 
@@ -422,12 +470,9 @@ class CommonKVManager(BaseKVManager):
     ) -> bool:
         request_id = self._normalize_request_id(request_id)
         with self._get_request_status_lock():
-            active_request_id = getattr(self, "_room_request_ids", {}).get(
-                bootstrap_room
-            )
-            return bootstrap_room in self.request_status and (
-                active_request_id == request_id
-                or (active_request_id is None and request_id == "")
+            return (
+                bootstrap_room in self.request_status
+                and self._request_id_matches_active(bootstrap_room, request_id)
             )
 
     def store_transfer_info(
@@ -450,10 +495,12 @@ class CommonKVManager(BaseKVManager):
                 bootstrap_room
             )
             if bootstrap_room in self.request_status:
-                if (
-                    active_request_id != request_id
-                    or self.request_status[bootstrap_room] != KVPoll.Bootstrapping
-                ):
+                if self.request_status[bootstrap_room] != KVPoll.Bootstrapping:
+                    return None
+                if not request_id and active_request_id:
+                    self.allow_legacy_generation(bootstrap_room)
+                    request_id = active_request_id
+                if active_request_id != request_id:
                     return None
                 infos = self.transfer_infos.setdefault(bootstrap_room, {})
             else:
@@ -505,6 +552,7 @@ class CommonKVManager(BaseKVManager):
                 return False
             self.request_status.pop(bootstrap_room, None)
             getattr(self, "_room_request_ids", {}).pop(bootstrap_room, None)
+            getattr(self, "_legacy_generation_rooms", set()).discard(bootstrap_room)
             if request_id:
                 retired = getattr(self, "_retired_room_generations", None)
                 if retired is None:
@@ -1535,6 +1583,10 @@ class CommonKVReceiver(BaseKVReceiver):
         self._setup_bootstrap_infos()
         if self.conclude_state == KVPoll.Failed:
             return
+        if not all(
+            info.get("generation_ids_supported", False) for info in self.bootstrap_infos
+        ):
+            self.kv_mgr.allow_legacy_generation(self.bootstrap_room)
         self.kv_mgr.update_status(
             self.bootstrap_room,
             KVPoll.WaitingForInput,

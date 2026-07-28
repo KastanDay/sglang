@@ -691,8 +691,9 @@ class MoriKVManager(CommonKVManager):
             str(int(status)).encode("ascii"),
             str(self._compute_prefill_unique_rank()).encode("ascii"),
             failure_reason.encode("utf-8") if failure_reason else b"",
-            (infos[0].request_id or "").encode("utf-8"),
         ]
+        if infos[0].request_id is not None:
+            payload.append(infos[0].request_id.encode("utf-8"))
         for info in infos:
             try:
                 na = NetworkAddress(info.endpoint, info.dst_port)
