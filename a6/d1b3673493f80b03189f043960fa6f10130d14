@@ -1,0 +1,23 @@
+python/sglang/srt/disaggregation/common/conn.py
+  s_1787a638fb71e0::t_adb958390c663b 252-256,1007
+python/sglang/srt/disaggregation/mori/conn.py
+  s_1787a638fb71e0::t_5ce1f027f5bd1a 423-424
+test/registered/unit/disaggregation/test_common_kv_status.py
+  s_1787a638fb71e0::t_4240a9e10035dd 4,36,38-39,41,43-59
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a6d1b3673493f80b03189f043960fa6f10130d14",
+  "prompts": {},
+  "sessions": {
+    "s_1787a638fb71e0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fa6c1-3964-71f0-b109-67e1ea3ce383",
+        "model": "unknown"
+      },
+      "human_author": "Kastan Day <kastan@cloudflare.com>"
+    }
+  }
+}
