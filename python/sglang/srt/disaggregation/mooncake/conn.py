@@ -707,27 +707,34 @@ class MooncakeKVManager(CommonKVManager):
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         if self.enable_custom_mem_pool:
-            futures = [
-                executor.submit(
-                    process_layer,
-                    src_ptr,
-                    dst_ptr,
-                    item_len,
-                )
-                for (src_ptr, dst_ptr, item_len) in layers_params
-            ]
-            for future in concurrent.futures.as_completed(futures):
-                status = future.result()
-                if status != 0:
-                    for f in futures:
-                        f.cancel()
-                    # cancel() is a no-op for a future that is already running,
-                    # so wait for the stragglers: returning early lets the
-                    # caller report failure -- and the scheduler free this
-                    # request's KV pages -- while sibling transfers are still
-                    # reading and writing them.
-                    concurrent.futures.wait(futures)
-                    return status
+            futures = []
+            try:
+                for src_ptr, dst_ptr, item_len in layers_params:
+                    futures.append(
+                        executor.submit(
+                            process_layer,
+                            src_ptr,
+                            dst_ptr,
+                            item_len,
+                        )
+                    )
+                for future in concurrent.futures.as_completed(futures):
+                    status = future.result()
+                    if status != 0:
+                        for f in futures:
+                            f.cancel()
+                        # cancel() is a no-op for a future that is already running,
+                        # so wait for the stragglers: returning early lets the
+                        # caller report failure -- and the scheduler free this
+                        # request's KV pages -- while sibling transfers are still
+                        # reading and writing them.
+                        concurrent.futures.wait(futures)
+                        return status
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                concurrent.futures.wait(futures)
+                raise
             return 0
         else:
             # Combining all layers' params in one batch transfer is more efficient
@@ -865,24 +872,34 @@ class MooncakeKVManager(CommonKVManager):
             )
 
         futures = []
-        for i in range(layers_current_pp_stage):
-            futures.append(
-                executor.submit(process_layer_tp_aware, src_k_ptrs[i], dst_k_ptrs[i])
-            )
-        for i in range(layers_current_pp_stage):
-            futures.append(
-                executor.submit(process_layer_tp_aware, src_v_ptrs[i], dst_v_ptrs[i])
-            )
+        try:
+            for i in range(layers_current_pp_stage):
+                futures.append(
+                    executor.submit(
+                        process_layer_tp_aware, src_k_ptrs[i], dst_k_ptrs[i]
+                    )
+                )
+            for i in range(layers_current_pp_stage):
+                futures.append(
+                    executor.submit(
+                        process_layer_tp_aware, src_v_ptrs[i], dst_v_ptrs[i]
+                    )
+                )
 
-        for future in concurrent.futures.as_completed(futures):
-            status = future.result()
-            if status != 0:
-                for f in futures:
-                    f.cancel()
-                # cancel() can't stop a running future; drain before reporting
-                # failure.
-                concurrent.futures.wait(futures)
-                return status
+            for future in concurrent.futures.as_completed(futures):
+                status = future.result()
+                if status != 0:
+                    for f in futures:
+                        f.cancel()
+                    # cancel() can't stop a running future; drain before
+                    # reporting failure.
+                    concurrent.futures.wait(futures)
+                    return status
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            concurrent.futures.wait(futures)
+            raise
 
         return 0
 

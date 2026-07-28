@@ -186,24 +186,31 @@ class AscendKVManager(MooncakeKVManager):
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         if self.enable_custom_mem_pool:
-            futures = [
-                executor.submit(
-                    process_layer,
-                    src_ptr,
-                    dst_ptr,
-                    item_len,
-                )
-                for (src_ptr, dst_ptr, item_len) in layers_params
-            ]
-            for future in concurrent.futures.as_completed(futures):
-                status = future.result()
-                if status != 0:
-                    for f in futures:
-                        f.cancel()
-                    # cancel() can't stop a running future; drain before
-                    # reporting failure.
-                    concurrent.futures.wait(futures)
-                    return status
+            futures = []
+            try:
+                for src_ptr, dst_ptr, item_len in layers_params:
+                    futures.append(
+                        executor.submit(
+                            process_layer,
+                            src_ptr,
+                            dst_ptr,
+                            item_len,
+                        )
+                    )
+                for future in concurrent.futures.as_completed(futures):
+                    status = future.result()
+                    if status != 0:
+                        for f in futures:
+                            f.cancel()
+                        # cancel() can't stop a running future; drain before
+                        # reporting failure.
+                        concurrent.futures.wait(futures)
+                        return status
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                concurrent.futures.wait(futures)
+                raise
         else:
             # Combining all layers' params in one batch transfer is more efficient
             # compared to using multiple threads
