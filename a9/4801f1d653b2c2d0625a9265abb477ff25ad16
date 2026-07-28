@@ -1,0 +1,27 @@
+python/sglang/srt/disaggregation/common/conn.py
+  s_1787a638fb71e0::t_3a1881b3171bbc 263-270,1169-1173,1420-1424
+python/sglang/srt/disaggregation/mooncake/conn.py
+  s_1787a638fb71e0::t_e5a41a986113ac 1598
+python/sglang/srt/disaggregation/mori/conn.py
+  s_1787a638fb71e0::t_1ae400ae97230d 419-431,508-542
+python/sglang/srt/disaggregation/nixl/conn.py
+  s_1787a638fb71e0::t_55cea542ca6dd9 637-642,2450
+test/registered/unit/disaggregation/test_common_kv_status.py
+  s_1787a638fb71e0::t_db7e4bfd2a21e0 54-55,57,59,61,67,71,75
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a94801f1d653b2c2d0625a9265abb477ff25ad16",
+  "prompts": {},
+  "sessions": {
+    "s_1787a638fb71e0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fa6c1-3964-71f0-b109-67e1ea3ce383",
+        "model": "unknown"
+      },
+      "human_author": "Kastan Day <kastan@cloudflare.com>"
+    }
+  }
+}
