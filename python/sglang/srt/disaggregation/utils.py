@@ -263,7 +263,7 @@ def poll_and_all_reduce_with_staging(
     server_args: Optional[ServerArgs] = None,
 ):
     """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
-    staging_handler.retry_pending_watermarks()
+    staging_handler.flush_pending_watermarks()
     for decode_req in decode_reqs:
         if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
             decode_req

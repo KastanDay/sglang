@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
-import itertools
 import logging
 import os
 import queue
 import struct
 import threading
 import time
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -92,11 +91,6 @@ ABORT_ACK_MAX_AGE_S = 60.0
 # Hard cap on owed ABORT_ACKs, so an abort storm against a dead peer cannot grow
 # the pending list, or the per-tick sweep over it, without bound.
 MAX_PENDING_ABORT_ACKS = 4096
-# Soft cap on tracked room lifetimes. Reaching it means the periodic sweep is not
-# keeping up, so an insert also does a *bounded* scan for reclaimable rooms.
-MAX_TRACKED_ROOMS = 4096
-# Entries examined per emergency scan, so an insert can never become O(n).
-MAX_EMERGENCY_SCAN = 256
 
 
 class RoomTransferLifetime:
@@ -366,7 +360,7 @@ class MooncakeKVManager(CommonKVManager):
             # lifecycle with self.transfer_infos: created when the room is first
             # seen (by the sender or by decode metadata, whichever comes first)
             # and dropped by MooncakeKVSender.clear().
-            self._room_lifetimes: OrderedDict[int, RoomTransferLifetime] = OrderedDict()
+            self._room_lifetimes: Dict[int, RoomTransferLifetime] = {}
             self._room_lifetimes_lock = threading.Lock()
             self._start_transfer_bookkeeping()
             self.start_prefill_thread()
@@ -458,10 +452,6 @@ class MooncakeKVManager(CommonKVManager):
         """Return a room lifetime while the caller holds its generation lock."""
         lifetime = self._room_lifetimes.get(room)
         if lifetime is None and create:
-            # Reclaim before inserting, so the entry being created can never be
-            # the one that gets evicted.
-            if len(self._room_lifetimes) >= MAX_TRACKED_ROOMS:
-                self._emergency_reclaim_rooms_locked()
             lifetime = self._room_lifetimes[room] = RoomTransferLifetime()
         return lifetime
 
@@ -479,33 +469,6 @@ class MooncakeKVManager(CommonKVManager):
             self.transfer_infos.pop(room, None)
             self.req_to_decode_prefix_len.pop(room, None)
             self.request_status.pop(room, None)
-
-    def _emergency_reclaim_rooms_locked(self) -> None:
-        """Bounded reclaim when the periodic sweep is not keeping up.
-
-        Scans at most ``MAX_EMERGENCY_SCAN`` of the oldest entries so an insert
-        can never degrade to O(tracked rooms); the sweep does the rest. The
-        normal bootstrap grace period still applies: the cap is soft when every
-        candidate may still be waiting for its local sender.
-        """
-        # islice over the live view keeps this O(MAX_EMERGENCY_SCAN); the keys are
-        # copied out first because the dict cannot be mutated while iterating.
-        cutoff = time.monotonic() - self._room_sweep_ttl
-        candidates = [
-            room
-            for room, lifetime in itertools.islice(
-                self._room_lifetimes.items(), MAX_EMERGENCY_SCAN
-            )
-            if lifetime.created_at <= cutoff and lifetime.is_reclaimable()
-        ]
-        self._retire_rooms_locked(candidates)
-        if not candidates:
-            logger.warning_once(
-                "Tracking more than %d Mooncake bootstrap rooms with none old "
-                "enough and reclaimable; allowing the soft cap to grow while "
-                "metadata-first rooms remain inside their bootstrap window.",
-                MAX_TRACKED_ROOMS,
-            )
 
     def _sweep_room_lifetimes(self) -> int:
         """Reclaim rooms that no local sender will ever release.

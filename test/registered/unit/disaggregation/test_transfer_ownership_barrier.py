@@ -14,7 +14,6 @@ import concurrent.futures
 import threading
 import time
 import unittest
-from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -34,7 +33,6 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.mooncake.conn import (
     ABORT_RETRY_INTERVAL_S,
-    MAX_EMERGENCY_SCAN,
     MooncakeKVManager,
     MooncakeKVReceiver,
     MooncakeKVSender,
@@ -64,7 +62,7 @@ def make_prefill_manager(
     mgr._unquiesced_lock = threading.Lock()
     mgr.bootstrap_timeout = 300
     mgr._room_sweep_ttl = room_sweep_ttl
-    mgr._room_lifetimes = OrderedDict()
+    mgr._room_lifetimes = {}
     mgr._room_lifetimes_lock = threading.Lock()
     mgr._endpoint_send_locks = {}
     mgr._endpoint_send_locks_lock = threading.Lock()
@@ -546,41 +544,6 @@ class TestPrefillOwnership(unittest.TestCase):
         sender.clear()
         self.assertNotIn(ROOM, mgr._room_lifetimes)
         self.assertNotIn(ROOM, mgr.request_status)
-
-    def test_tracked_rooms_are_bounded_without_evicting_a_live_room(self):
-        mgr = make_prefill_manager()
-        live = mgr._room_lifetime(-1, create=True)
-        mgr.open_room_transfers(-1)
-        self.assertTrue(live.try_lease())
-        with patch("sglang.srt.disaggregation.mooncake.conn.MAX_TRACKED_ROOMS", 4):
-            for room in range(200):
-                mgr._close_room_for_abort(room, b"").created_at = 0
-            # ... and rooms known only from decode metadata, which no local
-            # sender will ever release, must be bounded too.
-            for room in range(1000, 1200):
-                mgr._room_lifetime(room, create=True).created_at = 0
-        self.assertLessEqual(len(mgr._room_lifetimes), 8)
-        self.assertIn(
-            -1, mgr._room_lifetimes, "a claimed, leased room must never be evicted"
-        )
-
-    def test_emergency_reclaim_cost_does_not_grow_with_the_map(self):
-        # A saturated map of non-reclaimable rooms must not make every new room
-        # O(tracked rooms) on the bootstrap thread.
-        mgr = make_prefill_manager()
-        with patch("sglang.srt.disaggregation.mooncake.conn.MAX_TRACKED_ROOMS", 8):
-            for room in range(400):
-                lifetime = mgr._room_lifetime(room, create=True)
-                mgr.open_room_transfers(room)
-                self.assertTrue(lifetime.try_lease())
-            probe = Mock(side_effect=lambda: False)
-            with patch.object(RoomTransferLifetime, "is_reclaimable", probe):
-                mgr._room_lifetime(99999, create=True)
-        self.assertLessEqual(
-            probe.call_count,
-            MAX_EMERGENCY_SCAN,
-            "the reclaim scan must be bounded per insert",
-        )
 
     def test_sweep_reclaims_rooms_no_sender_will_release(self):
         mgr = make_prefill_manager(room_sweep_ttl=0.0)
@@ -1303,32 +1266,6 @@ class TestRoomStateRetirement(unittest.TestCase):
             ]
         )
 
-    def test_emergency_reclaim_retires_destinations_and_status_too(self):
-        # Same hazard as the sweep, via the other reclaim path: a request drawing
-        # a reclaimed room must not inherit the old decode's addresses.
-        mgr = make_prefill_manager()
-        self._room_with_metadata(mgr)
-        self.assertIn(ROOM, mgr.transfer_infos)
-        mgr._room_lifetimes[ROOM].created_at = 0
-        with patch("sglang.srt.disaggregation.mooncake.conn.MAX_TRACKED_ROOMS", 1):
-            mgr._room_lifetime(ROOM + 1, create=True)
-        self.assertNotIn(ROOM, mgr._room_lifetimes)
-        self.assertNotIn(ROOM, mgr.transfer_infos)
-        self.assertNotIn(ROOM, mgr.request_status)
-        self.assertNotIn(ROOM, mgr.req_to_decode_prefix_len)
-
-    def test_emergency_reclaim_preserves_live_metadata_first_room(self):
-        mgr = make_prefill_manager(room_sweep_ttl=300.0)
-        self._room_with_metadata(mgr)
-
-        with patch("sglang.srt.disaggregation.mooncake.conn.MAX_TRACKED_ROOMS", 1):
-            mgr._room_lifetime(ROOM + 1, create=True)
-
-        self.assertIn(ROOM, mgr._room_lifetimes)
-        self.assertIn(ROOM, mgr.transfer_infos)
-        self.assertIn(ROOM, mgr.request_status)
-        self.assertEqual(len(mgr._room_lifetimes), 2, "the tracked-room cap is soft")
-
     def test_metadata_publication_holds_the_lifetime_generation_lock(self):
         mgr = make_prefill_manager()
         mgr.session_lock = threading.Lock()
@@ -1515,7 +1452,7 @@ class TestWatermarkDelivery(unittest.TestCase):
         )
         return handler
 
-    def test_a_backpressured_watermark_is_resent(self):
+    def test_a_backpressured_subscriber_gets_the_latest_watermark(self):
         state = {"blocked": True}
         sent = []
 
@@ -1526,17 +1463,18 @@ class TestWatermarkDelivery(unittest.TestCase):
                 sent.append(parts)
 
         handler = self._handler(Socket())
-        handler._free_and_send_watermark(
-            1, SimpleNamespace(req=SimpleNamespace(bootstrap_room=ROOM))
-        )
+        handler._free_and_send_watermark(1)
         self.assertEqual(sent, [], "the send was backpressured")
-        self.assertTrue(handler._wm_retry, "the subscriber must be remembered")
+        self.assertTrue(
+            handler._pending_watermarks, "the subscriber must be remembered"
+        )
 
         state["blocked"] = False
-        handler.retry_pending_watermarks()
+        handler.staging_allocator.get_watermark.return_value = (4, 256)
+        handler.flush_pending_watermarks()
         self.assertEqual(len(sent), 1, "the current watermark must be resent")
-        self.assertEqual(sent[0][1:3], [b"3", b"128"])
-        self.assertFalse(handler._wm_retry)
+        self.assertEqual(sent[0][1:3], [b"4", b"256"])
+        self.assertFalse(handler._pending_watermarks)
 
     def test_retry_is_free_when_nothing_is_pending(self):
         sent = []
@@ -1546,7 +1484,7 @@ class TestWatermarkDelivery(unittest.TestCase):
                 sent.append(parts)
 
         handler = self._handler(Socket())
-        handler.retry_pending_watermarks()
+        handler.flush_pending_watermarks()
         self.assertEqual(sent, [])
 
 
