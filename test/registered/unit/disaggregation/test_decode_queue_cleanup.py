@@ -152,6 +152,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
 
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
         queue.queue = [decode_req]
+        queue._deferred_kv_releases = []
         queue.enable_staging = False
         queue.gloo_group = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
@@ -177,14 +178,23 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(queue.queue, [])
         self.assertTrue(receiver.clear_called)
         self.assertIsNone(decode_req.kv_receiver)
-        queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
         scheduler.output_streamer.stream_output.assert_called_once_with(
             [req], req.return_logprob
         )
         mock_prepare_abort.assert_called_once()
+        # The pages and metadata slot are in-flight write destinations, so the
+        # free is deferred for the grace period rather than immediate.
+        mock_release_kv_cache.assert_not_called()
+        queue.req_to_metadata_buffer_idx_allocator.free.assert_not_called()
+        with patch(
+            "sglang.srt.disaggregation.decode.time.monotonic",
+            return_value=queue._deferred_kv_releases[0][1] + 1,
+        ):
+            queue.pop_transferred()
         mock_release_kv_cache.assert_called_once_with(
             req, queue.tree_cache, is_insert=False
         )
+        queue.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(3)
 
     def test_retracted_decode_requests_keep_scheduler_non_idle(self):
         scheduler = Scheduler.__new__(Scheduler)

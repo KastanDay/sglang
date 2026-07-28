@@ -102,6 +102,14 @@ if TYPE_CHECKING:
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
+# How long a failed transfer's KV pages (and metadata buffer slot) stay
+# allocated before being freed. Our pages are the *destination* of the prefill
+# side's writes: the failure/abort notification stops it from starting new
+# chunks, but a chunk already in flight keeps writing until it drains. Freeing
+# immediately would let the next request be allocated pages that write still
+# lands in, silently corrupting its KV.
+KV_RELEASE_GRACE_PERIOD_S = 5.0
+
 
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
@@ -1717,6 +1725,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
+        # (decode_req, release_at): failed transfers whose KV pages are held
+        # for KV_RELEASE_GRACE_PERIOD_S while in-flight prefill writes drain.
+        self._deferred_kv_releases: List[Tuple[DecodeRequest, float]] = []
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -1913,6 +1924,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         kv_manager._staging_handler = self.staging_handler
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
+        self._process_deferred_kv_releases()
         if not self.queue:
             return []
 
@@ -1932,6 +1944,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         transferred_reqs = []
         indices_to_remove = set()
+        deferred_indices = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -1969,10 +1982,21 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-                # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                if poll != KVPoll.Failed:
+                    # HiCache restore failed but the transfer itself has not:
+                    # tell the prefill side to stop before its writes land in
+                    # pages we are about to release.
+                    decode_req.kv_receiver.abort()
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
+                # The pre-allocated kv cache (and the metadata buffer slot) are
+                # released after a grace period rather than here: a prefill
+                # chunk already in flight keeps writing into them until it
+                # drains. Not inserted into the tree since the request failed.
+                self._deferred_kv_releases.append(
+                    (decode_req, time.monotonic() + KV_RELEASE_GRACE_PERIOD_S)
+                )
+                deferred_indices.add(i)
                 indices_to_remove.add(i)
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
@@ -2017,6 +2041,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 self.staging_handler.unregister_decode_req(
                     self.queue[i].req.bootstrap_room
                 )
+            if i in deferred_indices:
+                # The metadata buffer slot is an in-flight write destination
+                # too (send_aux); _process_deferred_kv_releases frees it.
+                continue
             idx = self.queue[i].metadata_buffer_index
             assert idx != -1
             # Reset so the next owner sees actual_room == 0 ("not yet written")
@@ -2029,6 +2057,25 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         ]
 
         return transferred_reqs
+
+    def _process_deferred_kv_releases(self) -> None:
+        """Free failed transfers' pages once their grace period has passed."""
+        if not self._deferred_kv_releases:
+            return
+        now = time.monotonic()
+        remaining = []
+        for decode_req, release_at in self._deferred_kv_releases:
+            if now < release_at:
+                remaining.append((decode_req, release_at))
+                continue
+            release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+            idx = decode_req.metadata_buffer_index
+            assert idx != -1
+            # Reset so the next owner sees actual_room == 0 ("not yet written")
+            # instead of the stale value, avoiding a false-positive mismatch.
+            self.metadata_buffers.bootstrap_room[idx] = 0
+            self.req_to_metadata_buffer_idx_allocator.free(idx)
+        self._deferred_kv_releases = remaining
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
