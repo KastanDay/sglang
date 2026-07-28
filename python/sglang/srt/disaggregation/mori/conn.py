@@ -623,7 +623,7 @@ class MoriKVManager(CommonKVManager):
                         payload[4].decode("utf-8") if len(payload) > 4 else None
                     )
 
-                    with self._get_request_status_lock():
+                    with self._request_status_lock:
                         if not self.is_current_generation(bootstrap_room, request_id):
                             continue
 
@@ -1827,7 +1827,7 @@ class MoriKVReceiver(CommonKVReceiver):
     def clear(self) -> bool:
         if self.bootstrap_room is None:
             return False
-        with self.kv_mgr._get_request_status_lock():
+        with self.kv_mgr._request_status_lock:
             if not super().clear():
                 return False
             self.kv_mgr._cleanup_room_tracking(self.bootstrap_room)

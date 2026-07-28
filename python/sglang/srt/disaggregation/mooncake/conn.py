@@ -325,13 +325,13 @@ class MooncakeKVManager(CommonKVManager):
         room = int(msg[1].decode("ascii"))
         session_id = msg[4].decode("ascii")
         request_id = msg[5].decode("utf-8") if len(msg) > 5 else None
-        with self._get_request_status_lock():
+        with self._request_status_lock:
             if not self.is_current_generation(room, request_id):
                 return
             handler = self._staging_handler
-            assert handler is not None, (
-                "STAGING_REQ received before staging handler initialized"
-            )
+            assert (
+                handler is not None
+            ), "STAGING_REQ received before staging handler initialized"
             decode_req = handler._room_to_decode_req.get(room)
             if decode_req is None:
                 logger.warning(
@@ -1533,7 +1533,7 @@ class MooncakeKVManager(CommonKVManager):
                 if staging_deferred:
                     continue
 
-                with self._get_request_status_lock():
+                with self._request_status_lock:
                     if (
                         self.is_current_generation(kv_chunk.room, kv_chunk.request_id)
                         and self.check_status(kv_chunk.room) == KVPoll.Success
@@ -1574,7 +1574,7 @@ class MooncakeKVManager(CommonKVManager):
                         if len(waiting_req_bytes) > 7
                         else None
                     )
-                    with self._get_request_status_lock():
+                    with self._request_status_lock:
                         if self.is_current_generation(staging_room, request_id):
                             handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
                     continue
@@ -1690,13 +1690,13 @@ class MooncakeKVManager(CommonKVManager):
                     num_pages = int(msg[4].decode("ascii"))
                     session_id = msg[5].decode("ascii")
                     request_id = msg[7].decode("utf-8") if len(msg) > 7 else None
-                    with self._get_request_status_lock():
+                    with self._request_status_lock:
                         if not self.is_current_generation(room, request_id):
                             continue
                         handler = self._staging_handler
-                        assert handler is not None, (
-                            "CHUNK_READY received before staging handler initialized"
-                        )
+                        assert (
+                            handler is not None
+                        ), "CHUNK_READY received before staging handler initialized"
                         handler.handle_chunk_arrived(
                             room,
                             chunk_idx,
@@ -1727,7 +1727,7 @@ class MooncakeKVManager(CommonKVManager):
                     request_id_frame[0].decode("utf-8") if request_id_frame else None
                 )
 
-                with self._get_request_status_lock():
+                with self._request_status_lock:
                     if not self.is_current_generation(bootstrap_room, request_id):
                         continue
 

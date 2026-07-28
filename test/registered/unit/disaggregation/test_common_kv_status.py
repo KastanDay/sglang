@@ -17,7 +17,7 @@ class TestCommonKVStatus(unittest.TestCase):
     @staticmethod
     def _manager(status=None):
         manager = object.__new__(CommonKVManager)
-        manager.request_status = {}
+        manager._init_room_state()
         if status is not None:
             manager.request_status[7] = status
         return manager
@@ -251,7 +251,7 @@ class TestCommonKVStatus(unittest.TestCase):
             success_started.set()
             manager.update_status(7, KVPoll.Success)
 
-        with manager._get_request_status_lock():
+        with manager._request_status_lock:
             thread = threading.Thread(target=report_success)
             thread.start()
             self.assertTrue(success_started.wait(timeout=1))

@@ -120,6 +120,45 @@ class PrefillRankInfo:
         self.generation_ids_supported = bool(self.generation_ids_supported)
 
 
+class _BoundedRoomTable:
+    """Bookkeeping for room generations with no live sender/receiver.
+
+    Maps ``(bootstrap_room, request_id)`` to a value, evicting the oldest
+    entry beyond ``capacity``. Control messages can reference a room before
+    its sender exists (early metadata) or after it was cleared (retired
+    generations), so these tables must stay bounded even if a peer never
+    completes the handshake.
+    """
+
+    def __init__(self, capacity: int):
+        self._capacity = capacity
+        self._entries: OrderedDict[Tuple[int, str], Any] = OrderedDict()
+
+    def put(self, bootstrap_room: int, request_id: str, value: Any = None) -> None:
+        key = (bootstrap_room, request_id)
+        self._entries[key] = value
+        self._entries.move_to_end(key)
+        while len(self._entries) > self._capacity:
+            self._entries.popitem(last=False)
+
+    def get(self, bootstrap_room: int, request_id: str) -> Any:
+        return self._entries.get((bootstrap_room, request_id))
+
+    def contains(self, bootstrap_room: int, request_id: str) -> bool:
+        return (bootstrap_room, request_id) in self._entries
+
+    def discard(self, bootstrap_room: int, request_id: str) -> None:
+        self._entries.pop((bootstrap_room, request_id), None)
+
+    def pop_room(self, bootstrap_room: int) -> Dict[str, Any]:
+        """Remove and return every generation stored for one room."""
+        keys = [key for key in self._entries if key[0] == bootstrap_room]
+        return {
+            request_id: self._entries.pop((room, request_id))
+            for room, request_id in keys
+        }
+
+
 class CommonKVManager(BaseKVManager):
     _MAX_TRACKED_ROOM_GENERATIONS = 4096
 
@@ -182,28 +221,10 @@ class CommonKVManager(BaseKVManager):
         )
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
-        self.request_status: Dict[int, KVPoll] = {}
-        self._request_status_lock = threading.RLock()
-        self._room_request_ids: Dict[int, str] = {}
-        self._legacy_generation_rooms: Set[int] = set()
-        self._pending_metadata_ready: Dict[int, Set[str]] = defaultdict(set)
-        self._pending_metadata_ready_order: OrderedDict[Tuple[int, str], None] = (
-            OrderedDict()
-        )
-        self._pending_transfer_infos: Dict[int, Dict[str, Dict[Any, Any]]] = (
-            defaultdict(lambda: defaultdict(dict))
-        )
-        self._pending_transfer_info_order: OrderedDict[Tuple[int, str], None] = (
-            OrderedDict()
-        )
-        self._retired_room_generations: OrderedDict[Tuple[int, str], None] = (
-            OrderedDict()
-        )
+        self._init_room_state()
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_lock = threading.Lock()
-        self.failure_records: Dict[int, str] = {}
-        self.failure_lock = threading.Lock()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # When SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER is True, all CP ranks
@@ -267,17 +288,35 @@ class CommonKVManager(BaseKVManager):
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
 
+    def _init_room_state(self) -> None:
+        """Initialize room/generation bookkeeping shared by prefill and decode.
+
+        Kept as one method so unit tests can build a bare manager holding
+        exactly the state the room-lifecycle methods below rely on.
+        """
+        self.request_status: Dict[int, KVPoll] = {}
+        self._request_status_lock = threading.RLock()
+        self._room_request_ids: Dict[int, str] = {}
+        self._legacy_generation_rooms: Set[int] = set()
+        # (room, request_id) generations observed before their sender/receiver
+        # exists, and generations already cleared. Each table bounds itself.
+        self._pending_metadata_ready = _BoundedRoomTable(
+            self._MAX_TRACKED_ROOM_GENERATIONS
+        )
+        self._pending_transfer_infos = _BoundedRoomTable(
+            self._MAX_TRACKED_ROOM_GENERATIONS
+        )
+        self._retired_room_generations = _BoundedRoomTable(
+            self._MAX_TRACKED_ROOM_GENERATIONS
+        )
+        self.failure_records: Dict[int, str] = {}
+        self.failure_lock = threading.Lock()
+        # Prefill managers replace these with real tables later in __init__.
+        self.transfer_infos: Optional[Dict[int, Dict[Any, Any]]] = None
+        self.req_to_decode_prefix_len: Optional[Dict[int, int]] = None
+
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
-
-    def _get_request_status_lock(self):
-        # A few lightweight unit tests construct managers with object.__new__.
-        # Production instances always initialize the lock in __init__.
-        lock = getattr(self, "_request_status_lock", None)
-        if lock is None:
-            lock = threading.RLock()
-            self._request_status_lock = lock
-        return lock
 
     def update_status(
         self,
@@ -286,10 +325,8 @@ class CommonKVManager(BaseKVManager):
         request_id: Optional[str] = None,
     ):
         normalized_request_id = self._normalize_request_id(request_id)
-        with self._get_request_status_lock():
-            active_request_id = getattr(self, "_room_request_ids", {}).get(
-                bootstrap_room
-            )
+        with self._request_status_lock:
+            active_request_id = self._room_request_ids.get(bootstrap_room)
             if active_request_id is not None and not self._request_id_matches_active(
                 bootstrap_room, normalized_request_id
             ):
@@ -326,150 +363,113 @@ class CommonKVManager(BaseKVManager):
     ) -> bool:
         """Match tagged messages, or untagged messages from a negotiated legacy peer."""
         request_id = self._normalize_request_id(request_id)
-        active_request_id = getattr(self, "_room_request_ids", {}).get(bootstrap_room)
+        active_request_id = self._room_request_ids.get(bootstrap_room)
         return active_request_id == request_id or (
-            not request_id
-            and bootstrap_room in getattr(self, "_legacy_generation_rooms", set())
+            not request_id and bootstrap_room in self._legacy_generation_rooms
         )
 
     def allow_legacy_generation(self, bootstrap_room: int) -> None:
         """Allow untagged messages for one active mixed-version generation."""
-        with self._get_request_status_lock():
+        with self._request_status_lock:
             if bootstrap_room in self.request_status:
-                legacy_rooms = getattr(self, "_legacy_generation_rooms", None)
-                if legacy_rooms is None:
-                    legacy_rooms = set()
-                    self._legacy_generation_rooms = legacy_rooms
-                legacy_rooms.add(bootstrap_room)
+                self._legacy_generation_rooms.add(bootstrap_room)
 
     def wire_request_id(
         self, bootstrap_room: int, request_id: Optional[str]
     ) -> Optional[str]:
         """Omit generation frames when sending to a negotiated legacy peer."""
-        with self._get_request_status_lock():
-            if bootstrap_room in getattr(self, "_legacy_generation_rooms", set()):
+        with self._request_status_lock:
+            if bootstrap_room in self._legacy_generation_rooms:
                 return None
             return request_id
 
     def start_generation(self, bootstrap_room: int, request_id: Optional[str]) -> None:
+        """Open a new room generation and adopt any early-arrived metadata."""
         request_id = self._normalize_request_id(request_id)
-        with self._get_request_status_lock():
-            active_request_id = getattr(self, "_room_request_ids", {}).get(
-                bootstrap_room
-            )
+        with self._request_status_lock:
+            active_request_id = self._room_request_ids.get(bootstrap_room)
             if bootstrap_room in self.request_status and active_request_id not in (
                 None,
                 request_id,
             ):
                 return
-            is_new_generation = bootstrap_room not in self.request_status
-            if is_new_generation:
-                getattr(self, "_legacy_generation_rooms", set()).discard(bootstrap_room)
+            if bootstrap_room not in self.request_status:
+                self._legacy_generation_rooms.discard(bootstrap_room)
 
             self.update_status(
                 bootstrap_room, KVPoll.Bootstrapping, request_id=request_id
             )
-            room_request_ids = getattr(self, "_room_request_ids", None)
-            if room_request_ids is None:
-                room_request_ids = {}
-                self._room_request_ids = room_request_ids
-            room_request_ids[bootstrap_room] = request_id
-            if hasattr(self, "failure_records"):
-                failure_lock = getattr(self, "failure_lock", None)
-                if failure_lock is None:
-                    self.failure_records.pop(bootstrap_room, None)
-                else:
-                    with failure_lock:
-                        self.failure_records.pop(bootstrap_room, None)
+            self._room_request_ids[bootstrap_room] = request_id
+            with self.failure_lock:
+                self.failure_records.pop(bootstrap_room, None)
+            self._adopt_pending_transfer_infos(bootstrap_room, request_id)
+            self._adopt_pending_metadata_ready(bootstrap_room, request_id)
 
-            pending_transfer_infos = getattr(self, "_pending_transfer_infos", {}).pop(
-                bootstrap_room, {}
+    def _adopt_pending_transfer_infos(
+        self, bootstrap_room: int, request_id: str
+    ) -> None:
+        """Install early-arrived decode metadata that matches this generation."""
+        pending_by_request_id = self._pending_transfer_infos.pop_room(bootstrap_room)
+        if self.transfer_infos is None:
+            return
+        matching_infos = pending_by_request_id.get(request_id)
+        if matching_infos is None:
+            matching_infos = pending_by_request_id.get("")
+            if matching_infos is not None:
+                self.allow_legacy_generation(bootstrap_room)
+        if matching_infos is None:
+            self.transfer_infos.pop(bootstrap_room, None)
+            if self.req_to_decode_prefix_len is not None:
+                self.req_to_decode_prefix_len.pop(bootstrap_room, None)
+            return
+        self.transfer_infos[bootstrap_room] = matching_infos
+        if self.req_to_decode_prefix_len is not None:
+            self.req_to_decode_prefix_len[bootstrap_room] = next(
+                (
+                    info.decode_prefix_len
+                    for info in matching_infos.values()
+                    if info.decode_prefix_len is not None
+                ),
+                0,
             )
-            pending_order = getattr(self, "_pending_transfer_info_order", {})
-            for pending_request_id in pending_transfer_infos:
-                pending_order.pop((bootstrap_room, pending_request_id), None)
-            if hasattr(self, "transfer_infos"):
-                matching_infos = pending_transfer_infos.get(request_id)
-                if matching_infos is None:
-                    matching_infos = pending_transfer_infos.get("")
-                    if matching_infos is not None:
-                        self.allow_legacy_generation(bootstrap_room)
-                if matching_infos is not None:
-                    self.transfer_infos[bootstrap_room] = matching_infos
-                    if hasattr(self, "req_to_decode_prefix_len"):
-                        self.req_to_decode_prefix_len[bootstrap_room] = next(
-                            (
-                                info.decode_prefix_len
-                                for info in matching_infos.values()
-                                if info.decode_prefix_len is not None
-                            ),
-                            0,
-                        )
-                else:
-                    self.transfer_infos.pop(bootstrap_room, None)
-                    if hasattr(self, "req_to_decode_prefix_len"):
-                        self.req_to_decode_prefix_len.pop(bootstrap_room, None)
 
-            pending = getattr(self, "_pending_metadata_ready", {}).pop(
-                bootstrap_room, set()
-            )
-            pending_ready_order = getattr(self, "_pending_metadata_ready_order", {})
-            for pending_request_id in pending:
-                pending_ready_order.pop((bootstrap_room, pending_request_id), None)
-            if request_id in pending or "" in pending:
-                if request_id not in pending:
-                    self.allow_legacy_generation(bootstrap_room)
-                self.update_status(
-                    bootstrap_room, KVPoll.WaitingForInput, request_id=request_id
-                )
+    def _adopt_pending_metadata_ready(
+        self, bootstrap_room: int, request_id: str
+    ) -> None:
+        """Apply an early metadata-readiness signal that matches this generation."""
+        pending_request_ids = self._pending_metadata_ready.pop_room(bootstrap_room)
+        if request_id not in pending_request_ids and "" not in pending_request_ids:
+            return
+        if request_id not in pending_request_ids:
+            self.allow_legacy_generation(bootstrap_room)
+        self.update_status(
+            bootstrap_room, KVPoll.WaitingForInput, request_id=request_id
+        )
 
     def mark_metadata_ready(
         self, bootstrap_room: int, request_id: Optional[str]
     ) -> None:
         request_id = self._normalize_request_id(request_id)
-        with self._get_request_status_lock():
-            active_request_id = getattr(self, "_room_request_ids", {}).get(
-                bootstrap_room
-            )
+        with self._request_status_lock:
             if bootstrap_room in self.request_status:
                 if self._request_id_matches_active(bootstrap_room, request_id):
                     self.update_status(
                         bootstrap_room,
                         KVPoll.WaitingForInput,
-                        request_id=active_request_id,
+                        request_id=self._room_request_ids.get(bootstrap_room),
                     )
                 return
-
-            if request_id and (
-                bootstrap_room,
-                request_id,
-            ) in getattr(self, "_retired_room_generations", {}):
+            if request_id and self._retired_room_generations.contains(
+                bootstrap_room, request_id
+            ):
                 return
-            pending = getattr(self, "_pending_metadata_ready", None)
-            if pending is None:
-                pending = defaultdict(set)
-                self._pending_metadata_ready = pending
-            pending[bootstrap_room].add(request_id)
-            pending_order = getattr(self, "_pending_metadata_ready_order", None)
-            if pending_order is None:
-                pending_order = OrderedDict()
-                self._pending_metadata_ready_order = pending_order
-            pending_key = (bootstrap_room, request_id)
-            pending_order[pending_key] = None
-            pending_order.move_to_end(pending_key)
-            while len(pending_order) > self._MAX_TRACKED_ROOM_GENERATIONS:
-                (old_room, old_request_id), _ = pending_order.popitem(last=False)
-                old_pending = pending.get(old_room)
-                if old_pending is not None:
-                    old_pending.discard(old_request_id)
-                    if not old_pending:
-                        pending.pop(old_room, None)
+            self._pending_metadata_ready.put(bootstrap_room, request_id)
 
     def is_current_generation(
         self, bootstrap_room: int, request_id: Optional[str]
     ) -> bool:
         request_id = self._normalize_request_id(request_id)
-        with self._get_request_status_lock():
+        with self._request_status_lock:
             return (
                 bootstrap_room in self.request_status
                 and self._request_id_matches_active(bootstrap_room, request_id)
@@ -479,7 +479,7 @@ class CommonKVManager(BaseKVManager):
         self, bootstrap_room: int, request_id: Optional[str]
     ) -> bool:
         """Negotiate an old peer when its first room message is an abort."""
-        with self._get_request_status_lock():
+        with self._request_status_lock:
             if self.is_current_generation(bootstrap_room, request_id):
                 return True
             if (
@@ -505,10 +505,8 @@ class CommonKVManager(BaseKVManager):
         overwrite or inflate the new generation's peer table.
         """
         request_id = self._normalize_request_id(request_id)
-        with self._get_request_status_lock():
-            active_request_id = getattr(self, "_room_request_ids", {}).get(
-                bootstrap_room
-            )
+        with self._request_status_lock:
+            active_request_id = self._room_request_ids.get(bootstrap_room)
             if bootstrap_room in self.request_status:
                 if self.request_status[bootstrap_room] != KVPoll.Bootstrapping:
                     return None
@@ -519,39 +517,14 @@ class CommonKVManager(BaseKVManager):
                     return None
                 infos = self.transfer_infos.setdefault(bootstrap_room, {})
             else:
-                retired = getattr(self, "_retired_room_generations", {})
-                if request_id and (bootstrap_room, request_id) in retired:
+                if request_id and self._retired_room_generations.contains(
+                    bootstrap_room, request_id
+                ):
                     return None
-                pending = getattr(self, "_pending_transfer_infos", None)
-                if pending is None:
-                    pending = defaultdict(lambda: defaultdict(dict))
-                    self._pending_transfer_infos = pending
-                infos = pending[bootstrap_room][request_id]
-                pending_order = getattr(self, "_pending_transfer_info_order", None)
-                if pending_order is None:
-                    pending_order = OrderedDict()
-                    self._pending_transfer_info_order = pending_order
-                pending_key = (bootstrap_room, request_id)
-                pending_order[pending_key] = None
-                pending_order.move_to_end(pending_key)
-                while len(pending_order) > self._MAX_TRACKED_ROOM_GENERATIONS:
-                    old_room_request, _ = pending_order.popitem(last=False)
-                    old_room, old_request_id = old_room_request
-                    old_room_infos = pending.get(old_room)
-                    if old_room_infos is not None:
-                        old_room_infos.pop(old_request_id, None)
-                        if not old_room_infos:
-                            pending.pop(old_room, None)
-                    old_ready = getattr(self, "_pending_metadata_ready", {}).get(
-                        old_room
-                    )
-                    if old_ready is not None:
-                        old_ready.discard(old_request_id)
-                        if not old_ready:
-                            self._pending_metadata_ready.pop(old_room, None)
-                    getattr(self, "_pending_metadata_ready_order", {}).pop(
-                        (old_room, old_request_id), None
-                    )
+                infos = self._pending_transfer_infos.get(bootstrap_room, request_id)
+                if infos is None:
+                    infos = {}
+                self._pending_transfer_infos.put(bootstrap_room, request_id, infos)
             infos[peer_key] = transfer_info
             return infos
 
@@ -559,43 +532,17 @@ class CommonKVManager(BaseKVManager):
         self, bootstrap_room: int, request_id: Optional[str] = None
     ) -> bool:
         request_id = self._normalize_request_id(request_id)
-        with self._get_request_status_lock():
-            active_request_id = getattr(self, "_room_request_ids", {}).get(
-                bootstrap_room
-            )
+        with self._request_status_lock:
+            active_request_id = self._room_request_ids.get(bootstrap_room)
             if active_request_id is not None and active_request_id != request_id:
                 return False
             self.request_status.pop(bootstrap_room, None)
-            getattr(self, "_room_request_ids", {}).pop(bootstrap_room, None)
-            getattr(self, "_legacy_generation_rooms", set()).discard(bootstrap_room)
+            self._room_request_ids.pop(bootstrap_room, None)
+            self._legacy_generation_rooms.discard(bootstrap_room)
             if request_id:
-                retired = getattr(self, "_retired_room_generations", None)
-                if retired is None:
-                    retired = OrderedDict()
-                    self._retired_room_generations = retired
-                retired_key = (bootstrap_room, request_id)
-                retired[retired_key] = None
-                retired.move_to_end(retired_key)
-                while len(retired) > self._MAX_TRACKED_ROOM_GENERATIONS:
-                    retired.popitem(last=False)
-            pending_transfer_infos = getattr(self, "_pending_transfer_infos", {}).get(
-                bootstrap_room
-            )
-            if pending_transfer_infos is not None:
-                pending_transfer_infos.pop(request_id, None)
-                getattr(self, "_pending_transfer_info_order", {}).pop(
-                    (bootstrap_room, request_id), None
-                )
-                if not pending_transfer_infos:
-                    self._pending_transfer_infos.pop(bootstrap_room, None)
-            pending = getattr(self, "_pending_metadata_ready", {}).get(bootstrap_room)
-            if pending is not None:
-                pending.discard(request_id)
-                getattr(self, "_pending_metadata_ready_order", {}).pop(
-                    (bootstrap_room, request_id), None
-                )
-                if not pending:
-                    self._pending_metadata_ready.pop(bootstrap_room, None)
+                self._retired_room_generations.put(bootstrap_room, request_id)
+            self._pending_transfer_infos.discard(bootstrap_room, request_id)
+            self._pending_metadata_ready.discard(bootstrap_room, request_id)
             return True
 
     def record_failure(
@@ -604,7 +551,7 @@ class CommonKVManager(BaseKVManager):
         failure_reason: str,
         request_id: Optional[str] = None,
     ):
-        with self._get_request_status_lock():
+        with self._request_status_lock:
             if not self.is_current_generation(bootstrap_room, request_id):
                 return
             with self.failure_lock:
@@ -1155,9 +1102,9 @@ class CommonKVManager(BaseKVManager):
         """
         start_layer = self.kv_args.prefill_start_layer
         end_layer = getattr(self.kv_args, "prefill_end_layer", None)
-        assert end_layer is not None, (
-            "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
-        )
+        assert (
+            end_layer is not None
+        ), "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
 
         c4_full = sum(1 for r in mla_ratios if r == 4)
         c128_full = sum(1 for r in mla_ratios if r == 128)
@@ -1211,7 +1158,8 @@ class CommonKVManager(BaseKVManager):
             list(dst_kv_ptrs[swa_s:swa_e])
             + list(
                 dst_kv_ptrs[
-                    compress_section_start + c4_off_s : compress_section_start
+                    compress_section_start
+                    + c4_off_s : compress_section_start
                     + c4_off_e
                 ]
             )
@@ -1511,16 +1459,12 @@ class CommonKVSender(BaseKVSender):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> bool:
-        with self.kv_mgr._get_request_status_lock():
-            clear_status = getattr(self.kv_mgr, "clear_status", None)
-            if clear_status is not None:
-                if not clear_status(self.bootstrap_room, self.request_id):
-                    return False
-            else:
-                self.kv_mgr.request_status.pop(self.bootstrap_room, None)
-            if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
+        with self.kv_mgr._request_status_lock:
+            if not self.kv_mgr.clear_status(self.bootstrap_room, self.request_id):
+                return False
+            if self.kv_mgr.req_to_decode_prefix_len is not None:
                 self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
-            if hasattr(self.kv_mgr, "transfer_infos"):
+            if self.kv_mgr.transfer_infos is not None:
                 self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
             return True
 
@@ -1787,24 +1731,18 @@ class CommonKVReceiver(BaseKVReceiver):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> bool:
-        with self.kv_mgr._get_request_status_lock():
-            clear_status = getattr(self.kv_mgr, "clear_status", None)
-            if clear_status is not None:
-                if not clear_status(self.bootstrap_room, self.request_id):
-                    return False
-            else:
-                self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        with self.kv_mgr._request_status_lock:
+            if not self.kv_mgr.clear_status(self.bootstrap_room, self.request_id):
+                return False
             self.kv_mgr.required_prefill_response_num_table.pop(
                 self.bootstrap_room, None
             )
             self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
-            addr_to_rooms_tracker = getattr(self.kv_mgr, "addr_to_rooms_tracker", None)
-            if addr_to_rooms_tracker is not None:
-                tracked_rooms = addr_to_rooms_tracker.get(self.bootstrap_addr)
-                if tracked_rooms is not None:
-                    tracked_rooms.discard(self.bootstrap_room)
-                    if not tracked_rooms:
-                        addr_to_rooms_tracker.pop(self.bootstrap_addr, None)
+            tracked_rooms = self.kv_mgr.addr_to_rooms_tracker.get(self.bootstrap_addr)
+            if tracked_rooms is not None:
+                tracked_rooms.discard(self.bootstrap_room)
+                if not tracked_rooms:
+                    self.kv_mgr.addr_to_rooms_tracker.pop(self.bootstrap_addr, None)
             return True
 
     def abort(self):
