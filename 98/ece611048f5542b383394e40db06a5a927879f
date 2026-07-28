@@ -1,0 +1,19 @@
+python/sglang/srt/disaggregation/mori/conn.py
+  s_1787a638fb71e0::t_f5186cc900736f 507,511-558,1420-1421
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "98ece611048f5542b383394e40db06a5a927879f",
+  "prompts": {},
+  "sessions": {
+    "s_1787a638fb71e0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019fa6c1-3964-71f0-b109-67e1ea3ce383",
+        "model": "unknown"
+      },
+      "human_author": "Kastan Day <kastan@cloudflare.com>"
+    }
+  }
+}
