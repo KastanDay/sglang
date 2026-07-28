@@ -1288,6 +1288,9 @@ class Scheduler(
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
+            # (req, is_insert, deadline): failed requests whose KV release is
+            # parked until their in-flight transfer chunks drain.
+            self.disagg_prefill_pending_kv_releases: List[Tuple[Req, bool, float]] = []
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
@@ -2713,7 +2716,13 @@ class Scheduler(
             req.pending_bootstrap = False
         if self.enable_hicache_storage:
             self.tree_cache.release_aborted_request(req.rid)
-        release_kv_cache(req, self.tree_cache, is_insert=False)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # Earlier chunks may still be mid-send to the decode instance;
+            # releasing their pages now would let the next request reuse them
+            # while the transfer is still reading them.
+            self.maybe_defer_kv_release(req, is_insert=False)
+        else:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None

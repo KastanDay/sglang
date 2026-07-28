@@ -178,6 +178,15 @@ class BaseKVSender(ABC):
         """
         pass
 
+    def has_inflight_transfers(self) -> bool:
+        """
+        Whether transfer work started by this sender may still be reading the
+        request's KV pages. The scheduler defers freeing them while this is
+        True, so backends whose transfers outlive the failing call must
+        override it.
+        """
+        return False
+
 
 class BaseKVReceiver(ABC):
     @abstractmethod

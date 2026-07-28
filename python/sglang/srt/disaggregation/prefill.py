@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from array import array
 from collections import deque
 from http import HTTPStatus
@@ -76,6 +77,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+
+# Backstop for deferred KV releases (see maybe_defer_kv_release): the transfer
+# engine's synchronous calls carry their own timeouts, so a chunk normally
+# drains in well under this. Past it, release anyway rather than pin the pages
+# on a wedged transfer forever.
+KV_RELEASE_DRAIN_TIMEOUT_S = 30.0
 
 
 def should_force_retry(req: Req) -> bool:
@@ -795,6 +802,45 @@ class SchedulerDisaggregationPrefillMixin:
             dp_cooperation_info=batch.dp_cooperation_info,
         )
 
+    def maybe_defer_kv_release(
+        self: Scheduler, req: Req, is_insert: bool = True
+    ) -> None:
+        """Free the request's KV pages, unless a transfer worker is still
+        sending from them.
+
+        A request can be observed as failed (an abort from the decode side, or
+        a failure propagated from another rank) while a transfer worker on this
+        rank is mid-send for it. Freeing the pages then lets the next request
+        be allocated pages an in-flight transfer is still reading, so it would
+        silently send that request's KV to the failed request's decode
+        destination. Park the release until the worker drains (bounded).
+        """
+        if req.disagg_kv_sender.has_inflight_transfers():
+            self.disagg_prefill_pending_kv_releases.append(
+                (req, is_insert, time.monotonic() + KV_RELEASE_DRAIN_TIMEOUT_S)
+            )
+            return
+        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+
+    def process_pending_kv_releases(self: Scheduler) -> None:
+        """Free parked KV pages whose transfers have drained (or timed out)."""
+        if not self.disagg_prefill_pending_kv_releases:
+            return
+        now = time.monotonic()
+        still_pending = []
+        for req, is_insert, deadline in self.disagg_prefill_pending_kv_releases:
+            if req.disagg_kv_sender.has_inflight_transfers():
+                if now < deadline:
+                    still_pending.append((req, is_insert, deadline))
+                    continue
+                logger.error(
+                    f"Releasing KV pages of {req.rid=} while a transfer may "
+                    "still be sending them: the transfer did not drain within "
+                    f"{KV_RELEASE_DRAIN_TIMEOUT_S:.0f}s."
+                )
+            release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+        self.disagg_prefill_pending_kv_releases = still_pending
+
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
     ) -> List[Req]:
@@ -802,6 +848,7 @@ class SchedulerDisaggregationPrefillMixin:
         Poll the requests in the middle of transfer. If done, return the request.
         rids_to_check: For PP, on rank > 0, check the rids from the previous rank has consensus with the current rank.
         """
+        self.process_pending_kv_releases()
         if len(self.disagg_prefill_inflight_queue) == 0:
             return []
 
@@ -922,7 +969,7 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        release_kv_cache(req, self.tree_cache)  # unlock the tree
+        self.maybe_defer_kv_release(req)  # unlock the tree
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR

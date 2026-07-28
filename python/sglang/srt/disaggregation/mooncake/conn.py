@@ -188,6 +188,11 @@ class MooncakeKVManager(CommonKVManager):
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
+            # room -> number of chunks a transfer worker is currently sending.
+            # The scheduler must not free a failed request's KV pages while a
+            # chunk is mid-send (see MooncakeKVSender.has_inflight_transfers).
+            self._inflight_chunk_counts: Dict[int, int] = {}
+            self._inflight_chunk_lock = threading.Lock()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -1363,8 +1368,16 @@ class MooncakeKVManager(CommonKVManager):
             )
 
         while True:
+            inflight_room = None
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                # Count the chunk before the failed-room check below. The
+                # scheduler marks the room failed before consulting this
+                # counter, so either this worker observes the failure and
+                # skips, or the scheduler observes the counter and defers
+                # freeing the KV pages the chunk is reading.
+                inflight_room = kv_chunk.room
+                self._begin_inflight_chunk(inflight_room)
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -1598,6 +1611,27 @@ class MooncakeKVManager(CommonKVManager):
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
+            finally:
+                if inflight_room is not None:
+                    self._end_inflight_chunk(inflight_room)
+
+    def _begin_inflight_chunk(self, room: int) -> None:
+        with self._inflight_chunk_lock:
+            self._inflight_chunk_counts[room] = (
+                self._inflight_chunk_counts.get(room, 0) + 1
+            )
+
+    def _end_inflight_chunk(self, room: int) -> None:
+        with self._inflight_chunk_lock:
+            remaining = self._inflight_chunk_counts[room] - 1
+            if remaining:
+                self._inflight_chunk_counts[room] = remaining
+            else:
+                del self._inflight_chunk_counts[room]
+
+    def room_has_inflight_chunks(self, room: int) -> bool:
+        with self._inflight_chunk_lock:
+            return room in self._inflight_chunk_counts
 
     def start_prefill_thread(self):
         def bootstrap_thread():
@@ -1937,6 +1971,9 @@ class MooncakeKVSender(CommonKVSender):
             return status
         else:
             return self.conclude_state
+
+    def has_inflight_transfers(self) -> bool:
+        return self.kv_mgr.room_has_inflight_chunks(self.bootstrap_room)
 
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank
