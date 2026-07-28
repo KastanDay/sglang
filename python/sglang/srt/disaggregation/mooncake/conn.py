@@ -95,6 +95,8 @@ ABORT_ACK_MAX_AGE_S = 60.0
 # Hard cap on owed ABORT_ACKs, so an abort storm against a dead peer cannot grow
 # the pending list, or the per-tick sweep over it, without bound.
 MAX_PENDING_ABORT_ACKS = 4096
+
+
 @dataclasses.dataclass
 class _PendingAbortAck:
     """An ABORT_ACK owed to a decode rank once its room has drained."""
@@ -2540,83 +2542,68 @@ class MooncakeKVReceiver(CommonKVReceiver):
             return
         super().init(prefill_dp_rank)
 
-    def _register_kv_args(self) -> bool:
-        for bootstrap_info in self.bootstrap_infos:
-            packed_kv_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
-            )
-            packed_aux_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
-            )
-            packed_state_data_ptrs = pack_int_lists(
-                self.kv_mgr.kv_args.state_data_ptrs, "Q"
-            )
-            packed_state_item_lens = pack_int_lists(
-                self.kv_mgr.kv_args.state_item_lens, "I"
-            )
-            packed_state_dim_per_tensor = pack_int_lists(
-                getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", []) or [], "I"
-            )
-            packed_state_layer_ids = pack_int_lists(
-                self.kv_mgr.kv_args.state_layer_ids, "I"
-            )
-            packed_kv_layer_ids = b"".join(
-                struct.pack("I", layer_id)
-                for layer_id in self.kv_mgr.kv_args.kv_layer_ids
-            )
-            # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
-            tp_rank = self.kv_mgr.kv_args.engine_rank
+    def _send_to_prefill(
+        self, bootstrap_info: dict, parts: List[bytes], flags: int = 0
+    ) -> None:
+        """Send one control message to a prefill rank, serialized per socket.
+
+        Cached sockets are shared across receivers and zmq sockets are not
+        thread-safe.
+        """
+        sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+        with lock:
+            sock.send_multipart(parts, flags)
+
+    def _conclude_failed(self, reason: str) -> None:
+        self.kv_mgr.record_failure(self.bootstrap_room, reason)
+        self.conclude_state = KVPoll.Failed
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+
+    def _kv_args_parts(self) -> List[bytes]:
+        """The KV registration message; identical for every prefill rank."""
+        kv_args = self.kv_mgr.kv_args
+        if (
+            self.kv_mgr.enable_staging
+            and self.kv_mgr._staging_ctx.allocator is not None
+        ):
+            _alloc = self.kv_mgr._staging_ctx.allocator
+            packed_staging_base_ptr = struct.pack("Q", _alloc.get_base_ptr())
+            staging_total_size_str = str(_alloc.get_total_size()).encode("ascii")
+        else:
+            packed_staging_base_ptr = b""
+            staging_total_size_str = b""
+        return [
+            "None".encode("ascii"),
+            self.kv_mgr.local_ip.encode("ascii"),
+            str(self.kv_mgr.rank_port).encode("ascii"),
+            self.session_id.encode("ascii"),
+            b"".join(struct.pack("Q", ptr) for ptr in kv_args.kv_data_ptrs),
+            b"".join(struct.pack("Q", ptr) for ptr in kv_args.aux_data_ptrs),
+            pack_int_lists(kv_args.state_data_ptrs, "Q"),
+            # Note(shangming): No need to add pp rank here since decode pp size
+            # should be equal to prefill pp size or 1
+            str(kv_args.engine_rank).encode("ascii"),
+            str(self.kv_mgr.attn_tp_size).encode("ascii"),
             # Some pools have no full-token contiguous KV (kv_item_lens empty)
             # and ship per-pool instead, so report 0.
-            kv_item_len = (
-                self.kv_mgr.kv_args.kv_item_lens[0]
-                if self.kv_mgr.kv_args.kv_item_lens
-                else 0
-            )
-            dst_tp_rank = str(tp_rank).encode("ascii")
-            dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
-            dst_kv_item_len = str(kv_item_len).encode("ascii")
-            if (
-                self.kv_mgr.enable_staging
-                and self.kv_mgr._staging_ctx.allocator is not None
-            ):
-                _alloc = self.kv_mgr._staging_ctx.allocator
-                packed_staging_base_ptr = struct.pack("Q", _alloc.get_base_ptr())
-                staging_total_size_str = str(_alloc.get_total_size()).encode("ascii")
-            else:
-                packed_staging_base_ptr = b""
-                staging_total_size_str = b""
+            str(kv_args.kv_item_lens[0] if kv_args.kv_item_lens else 0).encode("ascii"),
+            pack_int_lists(kv_args.state_item_lens, "I"),
+            pack_int_lists(getattr(kv_args, "state_dim_per_tensor", []) or [], "I"),
+            b"".join(struct.pack("I", layer_id) for layer_id in kv_args.kv_layer_ids),
+            pack_int_lists(kv_args.state_layer_ids, "I"),
+            packed_staging_base_ptr,
+            staging_total_size_str,
+        ]
 
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+    def _register_kv_args(self) -> bool:
+        parts = self._kv_args_parts()
+        for bootstrap_info in self.bootstrap_infos:
             try:
-                with lock:
-                    sock.send_multipart(
-                        [
-                            "None".encode("ascii"),
-                            self.kv_mgr.local_ip.encode("ascii"),
-                            str(self.kv_mgr.rank_port).encode("ascii"),
-                            self.session_id.encode("ascii"),
-                            packed_kv_data_ptrs,
-                            packed_aux_data_ptrs,
-                            packed_state_data_ptrs,
-                            dst_tp_rank,
-                            dst_attn_tp_size,
-                            dst_kv_item_len,
-                            packed_state_item_lens,
-                            packed_state_dim_per_tensor,
-                            packed_kv_layer_ids,
-                            packed_state_layer_ids,
-                            packed_staging_base_ptr,
-                            staging_total_size_str,
-                        ]
-                    )
+                self._send_to_prefill(bootstrap_info, parts)
             except zmq.ZMQError:
-                self.kv_mgr.record_failure(
-                    self.bootstrap_room,
+                self._conclude_failed(
                     f"_register_kv_args to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
                 )
-                self.conclude_state = KVPoll.Failed
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return False
         return True
 
@@ -2650,49 +2637,39 @@ class MooncakeKVReceiver(CommonKVReceiver):
             )
 
         for bootstrap_info, abort_token in self._abort_targets_snapshot():
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
+            parts = [
+                str(self.bootstrap_room).encode("ascii"),
+                self.kv_mgr.local_ip.encode("ascii"),
+                str(self.kv_mgr.rank_port).encode("ascii"),
+                self.session_id.encode("ascii"),
+                kv_indices.tobytes() if not is_dummy else b"",
+                str(aux_index).encode("ascii") if not is_dummy else b"",
+                (
+                    pack_int_lists(state_indices, "i")
+                    if not is_dummy and state_indices
+                    else b""
+                ),
+                str(self.required_dst_info_num).encode("ascii"),
+                str(decode_prefix_len or 0).encode("ascii"),
+                abort_token,
+            ]
+            # Register exposure before the send so an abort racing a successful
+            # send cannot receive and discard an early ACK. ZeroMQ delivers
+            # multipart messages atomically, so a send that raises exposed no
+            # complete metadata and the exposure is withdrawn.
+            self._record_metadata_exposure(abort_token)
             try:
-                with lock:
-                    # Register exposure before send so an abort racing a
-                    # successful send cannot receive and discard an early ACK.
-                    # ZeroMQ delivers multipart messages atomically, so a send
-                    # that raises exposed no complete metadata and is removed.
-                    self._record_metadata_exposure(abort_token)
-                    try:
-                        sock.send_multipart(
-                            [
-                                str(self.bootstrap_room).encode("ascii"),
-                                self.kv_mgr.local_ip.encode("ascii"),
-                                str(self.kv_mgr.rank_port).encode("ascii"),
-                                self.session_id.encode("ascii"),
-                                kv_indices.tobytes() if not is_dummy else b"",
-                                (
-                                    str(aux_index).encode("ascii")
-                                    if not is_dummy
-                                    else b""
-                                ),
-                                (
-                                    pack_int_lists(state_indices, "i")
-                                    if not is_dummy and state_indices
-                                    else b""
-                                ),
-                                str(self.required_dst_info_num).encode("ascii"),
-                                str(decode_prefix_len or 0).encode("ascii"),
-                                abort_token,
-                            ]
-                        )
-                    except Exception:
-                        self._discard_metadata_exposure(abort_token)
-                        raise
+                self._send_to_prefill(bootstrap_info, parts)
             except zmq.ZMQError:
-                self.kv_mgr.record_failure(
-                    self.bootstrap_room,
+                self._discard_metadata_exposure(abort_token)
+                self._conclude_failed(
                     f"send_metadata to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
                 )
-                self.conclude_state = KVPoll.Failed
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
+            except Exception:
+                self._discard_metadata_exposure(abort_token)
+                raise
         self.init_time = time.time()
 
     def poll(self) -> KVPoll:
@@ -2864,18 +2841,17 @@ class MooncakeKVReceiver(CommonKVReceiver):
             # backed-up or dead prefill into a retry on the next poll instead of
             # an unbounded stall of the whole engine.
             try:
-                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-                with lock:
-                    sock.send_multipart(
-                        [
-                            b"ABORT",
-                            str(self.bootstrap_room).encode("ascii"),
-                            self.kv_mgr.local_ip.encode("ascii"),
-                            str(self.kv_mgr.rank_port).encode("ascii"),
-                            token,
-                        ],
-                        zmq.NOBLOCK,
-                    )
+                self._send_to_prefill(
+                    bootstrap_info,
+                    [
+                        b"ABORT",
+                        str(self.bootstrap_room).encode("ascii"),
+                        self.kv_mgr.local_ip.encode("ascii"),
+                        str(self.kv_mgr.rank_port).encode("ascii"),
+                        token,
+                    ],
+                    flags=zmq.NOBLOCK,
+                )
             except zmq.Again:
                 # Retried by the next _send_abort_notification() tick.
                 with self._abort_lock:

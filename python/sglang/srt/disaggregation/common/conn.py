@@ -727,7 +727,6 @@ class CommonKVManager(BaseKVManager):
             self._monitor_cache[endpoint] = sock.get_monitor_socket(
                 zmq.EVENT_DISCONNECTED
             )
-            self._socket_send_locks.setdefault(endpoint, threading.Lock())
             return sock
 
     def _send_multipart_locked(
@@ -742,11 +741,13 @@ class CommonKVManager(BaseKVManager):
         Cached sockets are shared across sender threads and zmq sockets are not
         thread-safe. *flags* accepts ``zmq.NOBLOCK`` for messages the caller
         retries, so one unreachable peer cannot hold this lock for SNDTIMEO.
+
+        This is the only caller of ``_connect``, so the endpoint lock covers
+        connection validation as well as the send. Otherwise one thread could
+        receive the cached socket from ``_connect()``, then another could
+        observe a disconnect and close/replace that socket before the first
+        thread starts sending.
         """
-        # The endpoint lock must cover connection validation as well as send.
-        # Otherwise one thread can receive the cached socket from _connect(),
-        # then another can observe a disconnect and close/replace that socket
-        # before the first thread acquires this lock.
         with self._socket_lock:
             send_lock = self._socket_send_locks.setdefault(endpoint, threading.Lock())
         with send_lock:
