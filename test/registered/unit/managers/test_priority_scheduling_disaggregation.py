@@ -11,6 +11,7 @@ import torch
 from sglang.srt.disaggregation.decode import (  # noqa: E402
     DecodePreallocQueue,
     SchedulerDisaggregationDecodeMixin,
+    _generation_request_id,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req  # noqa: E402
@@ -247,6 +248,7 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
     def _new_req(self):
         return SimpleNamespace(
             rid="rid-0",
+            retraction_count=2,
             origin_input_ids=np.array([1, 2], dtype=np.int32),
             output_ids=[np.int32(3), np.int32(4)],
             sampling_params=self._sampling_params(),
@@ -278,6 +280,15 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
         self.assertNotIn("pd_rebootstrap_forced_output_id", payload)
         # Must be JSON-serializable (numpy scalars would raise here).
         json.dumps(payload)
+
+    def test_rebootstrap_uses_fresh_shared_generation_id(self):
+        req = self._new_req()
+
+        self.assertEqual(_generation_request_id(req, False), "rid-0")
+        self.assertEqual(
+            _generation_request_id(req, True),
+            "rid-0:rebootstrap:2",
+        )
 
 
 class TestCommonKVManagerPrefillRecompute(unittest.TestCase):

@@ -106,6 +106,12 @@ def _bootstrap_addr(req: Req) -> str:
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
 
 
+def _generation_request_id(req: Req, is_rebootstrap: bool) -> str:
+    if not is_rebootstrap:
+        return req.rid
+    return f"{req.rid}:rebootstrap:{req.retraction_count}"
+
+
 class DecodeReqToTokenPool:
     """
     The difference of DecodeReqToTokenPool and ReqToTokenPool is that
@@ -576,11 +582,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         kv_receiver_class = get_kv_class(backend, KVClassType.RECEIVER)
 
+        request_id = _generation_request_id(req, is_rebootstrap)
         kv_receiver = kv_receiver_class(
             mgr=self.kv_manager,
             bootstrap_addr=_bootstrap_addr(req),
             bootstrap_room=req.bootstrap_room,
-            request_id=req.rid,
+            request_id=request_id,
         )
 
         decode_req = DecodeRequest(
@@ -1180,9 +1187,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_prefix_len=total_prefix_len,
             )
             if decode_req.is_rebootstrap:
+                rebootstrap_payload = decode_req.req.build_rebootstrap_payload()
+                rebootstrap_payload["rid"] = decode_req.kv_receiver.request_id
                 self.kv_manager.submit_prefill_recompute(
                     decode_req.kv_receiver,
-                    decode_req.req.build_rebootstrap_payload(),
+                    rebootstrap_payload,
                 )
             if (
                 self.transfer_queue.enable_staging

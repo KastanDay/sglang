@@ -568,28 +568,32 @@ class NixlKVManager(CommonKVManager):
 
         room = int(msg[1].decode("ascii"))
         session_id = msg[4].decode("ascii")
-        handler = self._staging_handler
-        assert handler is not None, (
-            "STAGING_REQ received before staging handler initialized"
-        )
-        decode_req = handler._room_to_decode_req.get(room)
-        if decode_req is None:
-            logger.warning(
-                "STAGING_REQ received for unregistered room=%s, skipping",
-                room,
+        request_id = msg[5].decode("utf-8") if len(msg) > 5 else None
+        with self._get_request_status_lock():
+            if not self.is_current_generation(room, request_id):
+                return
+            handler = self._staging_handler
+            assert handler is not None, (
+                "STAGING_REQ received before staging handler initialized"
             )
-            return
-        prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
-        handle_staging_req(
-            msg,
-            self._staging_ctx.allocator,
-            self.kv_args,
-            self.attn_tp_size,
-            prefill_tp,
-            getattr(self, "kv_buffer_tensors", None),
-            self._staging_ctx.room_receivers,
-            self._staging_ctx.room_bootstrap,
-        )
+            decode_req = handler._room_to_decode_req.get(room)
+            if decode_req is None:
+                logger.warning(
+                    "STAGING_REQ received for unregistered room=%s, skipping",
+                    room,
+                )
+                return
+            prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
+            handle_staging_req(
+                msg,
+                self._staging_ctx.allocator,
+                self.kv_args,
+                self.attn_tp_size,
+                prefill_tp,
+                getattr(self, "kv_buffer_tensors", None),
+                self._staging_ctx.room_receivers,
+                self._staging_ctx.room_bootstrap,
+            )
 
         receiver = self._staging_ctx.room_receivers.get(room)
         if receiver is not None:
@@ -2479,7 +2483,17 @@ class NixlKVManager(CommonKVManager):
                             handle_staging_rsp,
                         )
 
-                        handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
+                        staging_room = int(waiting_req_bytes[1].decode("ascii"))
+                        request_id = (
+                            waiting_req_bytes[7].decode("utf-8")
+                            if len(waiting_req_bytes) > 7
+                            else None
+                        )
+                        with self._get_request_status_lock():
+                            if self.is_current_generation(staging_room, request_id):
+                                handle_staging_rsp(
+                                    waiting_req_bytes, self.transfer_infos
+                                )
                     continue
 
                 if self._handle_abort_notification(waiting_req_bytes):
