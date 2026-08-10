@@ -576,6 +576,11 @@ class Scheduler(
             )
         else:
             self.decode_offload_manager = None
+        self.prepare_kv_release = (
+            self.decode_offload_manager.prepare_retraction
+            if self.decode_offload_manager is not None
+            else None
+        )
 
         # Init running status
         self.init_running_status()
@@ -3257,6 +3262,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            prepare_kv_release=self.prepare_kv_release,
         )
 
         if self.chunked_req is not None:
@@ -3489,7 +3495,8 @@ class Scheduler(
                 else None
             )
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args
+                self.server_args,
+                prepare_kv_release=self.prepare_kv_release,
             )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
@@ -4612,6 +4619,7 @@ class Scheduler(
                 tree_cache=self.tree_cache,
                 hisparse_coordinator=self.hisparse_coordinator,
                 offload_kv=False,
+                prepare_kv_release=self.prepare_kv_release,
             )
         self.running_batch.reqs = []
         for req in retract_reqs:
