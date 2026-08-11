@@ -213,28 +213,58 @@ class DecodeKVCacheOffloadManager:
         self._check_offload_progress(n_write)
         self._check_backup_progress(n_backup)
 
-    def _collective_min_queue_sizes(self, *queue_sizes):
-        queue_sizes = torch.tensor(queue_sizes, dtype=torch.int, device="cpu")
-        if getattr(self, "tp_world_size", 1) > 1:
+    def _collective_min_queue_sizes(self, *queue_sizes: int) -> tuple[int, ...]:
+        """MIN-reduce ack queue sizes across TP ranks. Collective: every rank
+        in ``tp_group`` must call this the same number of times, in the same
+        order, or the group deadlocks."""
+        sizes = torch.tensor(queue_sizes, dtype=torch.int, device="cpu")
+        if self.tp_world_size > 1:
             torch.distributed.all_reduce(
-                queue_sizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+                sizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
             )
-        return map(int, queue_sizes.tolist())
+        return tuple(int(s) for s in sizes.tolist())
 
     def _collective_any(self, value: bool) -> bool:
+        """MAX-reduce a rank-local flag across TP ranks (logical any).
+        Collective: same lockstep contract as ``_collective_min_queue_sizes``."""
         result = torch.tensor(int(value), dtype=torch.int, device="cpu")
-        if getattr(self, "tp_world_size", 1) > 1:
+        if self.tp_world_size > 1:
             torch.distributed.all_reduce(
                 result, op=torch.distributed.ReduceOp.MAX, group=self.tp_group
             )
         return bool(result.item())
 
     def prepare_retraction(self, req: Req):
+        """Barrier before retraction releases (or copies out) this request's KV.
+
+        Drains the D2H acknowledgement path so no asynchronous offload is still
+        reading the request's device pages when the caller frees them.
+
+        Collective: all TP ranks must call this for the same requests in the
+        same order (retraction decisions are replicated across ranks), or the
+        ``tp_group`` all_reduce deadlocks.
+
+        The drain is bounded by the collective MIN of the ack queue sizes, so
+        one pass fully drains it when rank states agree; an inflight offload
+        surviving the drain implies cross-rank divergence (e.g. the host pool
+        allocation failed on a subset of ranks in ``offload_kv_cache``). That
+        never self-heals — retrying would reduce the same MIN — so fail closed:
+        crashing beats releasing pages an active D2H copy is still reading,
+        which would persist another request's KV under this request's keys.
+        """
         if not self._collective_any(self._has_inflight_offload(req.rid)):
             return
 
         self.check_offload_progress()
         if self._collective_any(self._has_inflight_offload(req.rid)):
+            logger.error(
+                "Decode KV offload state diverged across TP ranks: request %s "
+                "still has %d inflight offload(s) after a full drain "
+                "(local ack_write_queue length: %d)",
+                req.rid,
+                self.offload_inflight.get(req.rid, 0),
+                len(self.cache_controller.ack_write_queue),
+            )
             raise RuntimeError(
                 f"Cannot retract request {req.rid} with inflight decode KV offload"
             )

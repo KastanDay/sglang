@@ -25,7 +25,18 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 from sglang.srt.runtime_context import (
     get_device,
@@ -559,28 +570,7 @@ class Scheduler(
 
         self.init_hisparse_coordinator()
 
-        if (
-            get_disagg().disaggregation_mode == "decode"
-            and get_disagg().disaggregation_decode_enable_offload_kvcache
-        ):
-            self.decode_offload_manager = DecodeKVCacheOffloadManager(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                tp_group=(
-                    self.attn_tp_cpu_group
-                    if self.enable_dp_attention
-                    else self.tp_cpu_group
-                ),
-                tree_cache=self.tree_cache,
-                server_args=self.server_args,
-            )
-        else:
-            self.decode_offload_manager = None
-        self.prepare_kv_release = (
-            self.decode_offload_manager.prepare_retraction
-            if self.decode_offload_manager is not None
-            else None
-        )
+        self.maybe_init_decode_offload_manager()
 
         # Init running status
         self.init_running_status()
@@ -1123,6 +1113,28 @@ class Scheduler(
         # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture.
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
+    def maybe_init_decode_offload_manager(self) -> None:
+        self.decode_offload_manager: Optional[DecodeKVCacheOffloadManager] = None
+        self.prepare_kv_release: Optional[Callable[[Req], None]] = None
+        if not (
+            get_disagg().disaggregation_mode == "decode"
+            and get_disagg().disaggregation_decode_enable_offload_kvcache
+        ):
+            return
+
+        self.decode_offload_manager = DecodeKVCacheOffloadManager(
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tp_group=(
+                self.attn_tp_cpu_group
+                if self.enable_dp_attention
+                else self.tp_cpu_group
+            ),
+            tree_cache=self.tree_cache,
+            server_args=self.server_args,
+        )
+        self.prepare_kv_release = self.decode_offload_manager.prepare_retraction
 
     def init_running_status(self):
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.

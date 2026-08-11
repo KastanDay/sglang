@@ -1,7 +1,5 @@
-import sys
 import unittest
 from collections import deque
-from contextlib import ExitStack
 from types import SimpleNamespace
 from typing import List, Optional
 from unittest.mock import MagicMock, patch
@@ -12,8 +10,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
-sys.modules.setdefault("mlx", MagicMock())
-sys.modules.setdefault("mlx.core", MagicMock())
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
@@ -25,7 +21,6 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 register_cpu_ci(est_time=9, suite="base-c-test-cpu")
@@ -505,129 +500,53 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         )
 
     def test_decode_offload_manager_provisions_prepare_callback(self):
+        """Guards the init wiring: constructing the offload manager must also
+        wire prepare_kv_release to its prepare_retraction. Without this, a
+        diff that drops the wiring leaves the retraction barrier silently
+        disabled and every propagation test still green (they set
+        prepare_kv_release by hand)."""
         from sglang.srt.runtime_context import get_context
 
-        class StopAfterProvisioning(Exception):
-            pass
-
         scheduler = Scheduler.__new__(Scheduler)
-        server_args = ServerArgs(
-            model_path="dummy",
-            disaggregation_mode="decode",
-            disaggregation_decode_enable_offload_kvcache=True,
-        )
-        pool_result = SimpleNamespace(
-            is_hybrid_swa=False,
-            is_hybrid_ssm=False,
-            sliding_window_size=None,
-            full_tokens_per_layer=None,
-            swa_tokens_per_layer=None,
-            req_to_token_pool=MagicMock(),
-            token_to_kv_pool_allocator=MagicMock(),
-            disable_radix_cache=False,
-            tree_cache=MagicMock(),
-        )
+        scheduler.req_to_token_pool = MagicMock()
+        scheduler.token_to_kv_pool_allocator = MagicMock()
+        scheduler.tree_cache = MagicMock()
+        scheduler.server_args = MagicMock()
+        scheduler.enable_dp_attention = False
+        scheduler.tp_cpu_group = MagicMock()
+        scheduler.attn_tp_cpu_group = MagicMock()
         offload_manager = MagicMock()
 
-        def init_model_config(instance):
-            instance.model_config = MagicMock()
-
-        def init_model_worker(instance):
-            instance.tp_worker = MagicMock()
-            instance.tp_worker.model_runner.canary_manager = None
-            instance.draft_worker = None
-            instance.attn_tp_cpu_group = MagicMock()
-            instance.tp_cpu_group = MagicMock()
-            instance.attn_cp_cpu_group = MagicMock()
-            instance.tp_group = MagicMock()
-            instance.pp_group = MagicMock()
-
-        no_op_initializers = (
-            "init_startup_timing_begin",
-            "init_soft_watchdog",
-            "init_metrics_collector",
-            "init_ipc_channels",
-            "init_idle_sleeper",
-            "init_zbal_on_npu",
-            "init_tokenizer",
-            "init_moe_gemm_config",
-            "init_mamba_backend",
-            "emit_metrics_constants",
-            "maybe_init_hccl_dp_prewarm",
-            "init_hisparse_coordinator",
-        )
-        with ExitStack() as stack:
-            # Scheduler.__init__ reads the published config bags (get_serving(),
-            # get_disagg(), get_observability()); publish, don't inject.
-            stack.enter_context(
-                get_context().override_server_args(
-                    disaggregation_mode="decode",
-                    disaggregation_decode_enable_offload_kvcache=True,
-                )
-            )
-            for name in no_op_initializers:
-                stack.enter_context(patch.object(Scheduler, name, autospec=True))
-            stack.enter_context(
-                patch.object(
-                    Scheduler,
-                    "init_model_config",
-                    autospec=True,
-                    side_effect=init_model_config,
-                )
-            )
-            stack.enter_context(
-                patch.object(
-                    Scheduler,
-                    "init_model_worker",
-                    autospec=True,
-                    side_effect=init_model_worker,
-                )
-            )
-            stack.enter_context(
-                patch(
-                    "sglang.srt.managers.scheduler.kv_cache_builder.build_kv_cache",
-                    return_value=pool_result,
-                )
-            )
-            stack.enter_context(
-                patch(
-                    "sglang.srt.managers.scheduler.DecodeKVCacheOffloadManager",
-                    return_value=offload_manager,
-                )
-            )
-            stack.enter_context(
-                patch("sglang.srt.managers.scheduler.maybe_revert_pr_fix")
-            )
-            # Stop right after the wiring under test: init_running_status is the
-            # next orchestration step in __init__.
-            stack.enter_context(
-                patch.object(
-                    Scheduler,
-                    "init_running_status",
-                    autospec=True,
-                    side_effect=StopAfterProvisioning,
-                )
-            )
-
-            with self.assertRaises(StopAfterProvisioning):
-                Scheduler.__init__(
-                    scheduler,
-                    server_args=server_args,
-                    port_args=SimpleNamespace(nccl_port=12345),
-                    gpu_id=0,
-                    tp_rank=0,
-                    moe_ep_rank=0,
-                    pp_rank=0,
-                    attn_cp_rank=0,
-                    moe_dp_rank=0,
-                    dp_rank=0,
-                )
+        with (
+            get_context().override_server_args(
+                disaggregation_mode="decode",
+                disaggregation_decode_enable_offload_kvcache=True,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.DecodeKVCacheOffloadManager",
+                return_value=offload_manager,
+            ) as manager_cls,
+        ):
+            scheduler.maybe_init_decode_offload_manager()
 
         self.assertIs(scheduler.decode_offload_manager, offload_manager)
         self.assertIs(
             scheduler.prepare_kv_release,
             offload_manager.prepare_retraction,
         )
+        self.assertIs(manager_cls.call_args.kwargs["tp_group"], scheduler.tp_cpu_group)
+
+    def test_decode_offload_manager_absent_without_offload_config(self):
+        """The disabled branch must leave both the manager and the callback
+        None (release paths treat a None callback as a no-op)."""
+        from sglang.srt.runtime_context import get_context
+
+        scheduler = Scheduler.__new__(Scheduler)
+        with get_context().override_server_args(disaggregation_mode="null"):
+            scheduler.maybe_init_decode_offload_manager()
+
+        self.assertIsNone(scheduler.decode_offload_manager)
+        self.assertIsNone(scheduler.prepare_kv_release)
 
     def test_pd_decode_continue_releases_held_rebootstrap(self):
         """continue_generation must enqueue staged rebootstrap reqs on resume."""
