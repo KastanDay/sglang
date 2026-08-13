@@ -64,6 +64,33 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
         self.ATTR_NAME_TO_MODALITY["image_position_ids"] = Modality.IMAGE
         self.ATTR_NAME_TO_MODALITY["video_position_ids"] = Modality.VIDEO
 
+    @staticmethod
+    def _set_position_aware_hash_fields(mm_items) -> None:
+        """Include position tensors in Gemma 4 vision cache identities."""
+        for item in mm_items:
+            if (
+                item.is_precomputed_embedding()
+                or item.precomputed_embeddings is not None
+            ):
+                continue
+
+            if item.is_image():
+                field_name = "image_position_ids"
+            elif item.is_video():
+                field_name = "video_position_ids"
+            elif item.is_audio():
+                field_name = "input_features_mask"
+            else:
+                continue
+
+            if field_name in item.model_specific_data:
+                item.hash_feature_fields = (field_name,)
+
+    def collect_mm_items_from_processor_output(self, data_dict, modality=None):
+        mm_items = super().collect_mm_items_from_processor_output(data_dict, modality)
+        self._set_position_aware_hash_fields(mm_items)
+        return mm_items
+
     def _get_audio_pad_multiple(self) -> int:
         """Derive the waveform padding alignment from processor config.
 

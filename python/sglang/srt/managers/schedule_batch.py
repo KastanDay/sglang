@@ -47,6 +47,7 @@ ScheduleBatch -> ForwardBatch
 
 import copy
 import dataclasses
+import hashlib
 import logging
 import re
 import sys
@@ -340,6 +341,9 @@ class MultimodalDataItem:
     # Model-specific data stored in a dictionary
     model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
 
+    # Model-specific data fields that also determine the cached embedding.
+    hash_feature_fields: Tuple[str, ...] = ()
+
     def __getattr__(self, name: str):
         if (
             "model_specific_data" in self.__dict__
@@ -390,7 +394,26 @@ class MultimodalDataItem:
                 hashed_feature = self.feature
             else:
                 hashed_feature = self.precomputed_embeddings
-            self.hash = hash_feature(hashed_feature)
+            feature_hashes = [hash_feature(hashed_feature)]
+            for field_name in self.hash_feature_fields:
+                if field_name not in self.model_specific_data:
+                    logger.warning(
+                        "Skipping missing multimodal hash feature field: %s",
+                        field_name,
+                    )
+                    continue
+                feature_hashes.append(
+                    hash_feature(self.model_specific_data[field_name])
+                )
+            if len(feature_hashes) == 1:
+                self.hash = feature_hashes[0]
+            else:
+                hasher = hashlib.sha256()
+                for feature_hash in feature_hashes:
+                    hasher.update(feature_hash.to_bytes(8, byteorder="big"))
+                self.hash = int.from_bytes(
+                    hasher.digest()[:8], byteorder="big", signed=False
+                )
         assert self.hash is not None
         self.pad_value = _compute_pad_value(self.hash)
 
