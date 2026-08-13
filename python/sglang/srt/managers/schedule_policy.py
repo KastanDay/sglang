@@ -31,7 +31,7 @@ import random
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Union
 
 import torch
 
@@ -520,6 +520,7 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        prepare_kv_release: Optional[Callable[[Req], None]] = None,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -614,6 +615,7 @@ class PrefillAdder:
         # Snapshot of scheduler waiting_queue length at the start of this
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
+        self.prepare_kv_release = prepare_kv_release
 
     def _admitted_extend_lens(self) -> List[int]:
         return [int(getattr(req, "extend_input_len", 0)) for req in self.can_run_list]
@@ -1491,7 +1493,10 @@ class PrefillAdder:
                 )
                 release_counter += 1
                 self.running_batch.release_req(
-                    i, len(self.running_batch.reqs) - release_counter, server_args
+                    i,
+                    len(self.running_batch.reqs) - release_counter,
+                    server_args,
+                    prepare_kv_release=self.prepare_kv_release,
                 )
             else:
                 keep_indices.append(i)

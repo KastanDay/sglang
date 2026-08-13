@@ -203,6 +203,7 @@ class SchedulerDllmMixin:
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=get_schedule().prefill_max_requests,
             dllm_config=self.dllm_config,
+            prepare_kv_release=self.prepare_kv_release,
         )
 
     def _process_dllm_batches(

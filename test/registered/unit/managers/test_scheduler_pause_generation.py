@@ -44,6 +44,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.hisparse_coordinator = MagicMock()
         scheduler.result_queue = deque()
         scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.prepare_kv_release = MagicMock()
         # Support _kv_snap diagnostic logging in patched schedulers
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.token_to_kv_pool_allocator.available_size.return_value = 1000
@@ -463,6 +464,89 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         # the device->host KV offload rather than offload-then-delete it.
         mock_retract_all.assert_called_once()
         self.assertEqual(mock_retract_all.call_args.kwargs["offload_kv"], False)
+        self.assertIs(
+            mock_retract_all.call_args.kwargs["prepare_kv_release"],
+            scheduler.prepare_kv_release,
+        )
+
+    def test_oom_retraction_forwards_prepare_callback(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_hierarchical_cache = False
+        scheduler.forward_ct = 1
+        scheduler.token_to_kv_pool_allocator = MagicMock()
+        scheduler.token_to_kv_pool_allocator.available_size.return_value = 0
+        scheduler.tree_cache = MagicMock()
+        scheduler.tree_cache.req_to_token_pool.mamba_allocator = None
+        scheduler.new_token_ratio_tracker = SimpleNamespace(current=1.0)
+        scheduler.server_args = MagicMock()
+        scheduler.prepare_kv_release = MagicMock()
+
+        batch = MagicMock()
+        batch.batch_size.return_value = 2
+        batch.is_empty.return_value = False
+        batch.check_decode_mem.return_value = False
+
+        class StopAfterRetraction(Exception):
+            pass
+
+        batch.retract_decode.side_effect = StopAfterRetraction
+
+        with self.assertRaises(StopAfterRetraction):
+            scheduler.update_running_batch(batch)
+
+        batch.retract_decode.assert_called_once_with(
+            scheduler.server_args,
+            prepare_kv_release=scheduler.prepare_kv_release,
+        )
+
+    def test_decode_offload_manager_provisions_prepare_callback(self):
+        """Guards the init wiring: constructing the offload manager must also
+        wire prepare_kv_release to its prepare_retraction. Without this, a
+        diff that drops the wiring leaves the retraction barrier silently
+        disabled and every propagation test still green (they set
+        prepare_kv_release by hand)."""
+        from sglang.srt.runtime_context import get_context
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.req_to_token_pool = MagicMock()
+        scheduler.token_to_kv_pool_allocator = MagicMock()
+        scheduler.tree_cache = MagicMock()
+        scheduler.server_args = MagicMock()
+        scheduler.enable_dp_attention = False
+        scheduler.tp_cpu_group = MagicMock()
+        scheduler.attn_tp_cpu_group = MagicMock()
+        offload_manager = MagicMock()
+
+        with (
+            get_context().override_server_args(
+                disaggregation_mode="decode",
+                disaggregation_decode_enable_offload_kvcache=True,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler.DecodeKVCacheOffloadManager",
+                return_value=offload_manager,
+            ) as manager_cls,
+        ):
+            scheduler.maybe_init_decode_offload_manager()
+
+        self.assertIs(scheduler.decode_offload_manager, offload_manager)
+        self.assertIs(
+            scheduler.prepare_kv_release,
+            offload_manager.prepare_retraction,
+        )
+        self.assertIs(manager_cls.call_args.kwargs["tp_group"], scheduler.tp_cpu_group)
+
+    def test_decode_offload_manager_absent_without_offload_config(self):
+        """The disabled branch must leave both the manager and the callback
+        None (release paths treat a None callback as a no-op)."""
+        from sglang.srt.runtime_context import get_context
+
+        scheduler = Scheduler.__new__(Scheduler)
+        with get_context().override_server_args(disaggregation_mode="null"):
+            scheduler.maybe_init_decode_offload_manager()
+
+        self.assertIsNone(scheduler.decode_offload_manager)
+        self.assertIsNone(scheduler.prepare_kv_release)
 
     def test_pd_decode_continue_releases_held_rebootstrap(self):
         """continue_generation must enqueue staged rebootstrap reqs on resume."""
