@@ -1,0 +1,31 @@
+python/sglang/srt/managers/schedule_batch.py
+  s_7f1fc1c8282b4c::t_6aefc3d5403ddd 50,344-346,397-416
+python/sglang/srt/multimodal/processors/gemma4.py
+  s_7e89e49a18bbbb::t_f8a9a4a6097315 67-93
+test/registered/unit/multimodal/test_gemma4_image_hash.py
+  s_7f1fc1c8282b4c::t_655615001eec65 1-139
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f6a5cde4b89544e276a90cb03e7fd9cfa1a70852",
+  "prompts": {},
+  "sessions": {
+    "s_7e89e49a18bbbb": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_007b62899ffejX3c3dNLtWxRcj",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    },
+    "s_7f1fc1c8282b4c": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0085f06cfffe7FlmFYvWPRWXAJ",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    }
+  }
+}
