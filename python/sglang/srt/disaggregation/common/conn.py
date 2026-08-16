@@ -209,6 +209,10 @@ class CommonKVManager(BaseKVManager):
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
         self.request_status: Dict[int, KVPoll] = {}
+        # Serializes status read-modify-write: transfer workers, the heartbeat
+        # checker, abort handling, and clear() all touch request_status from
+        # different threads.
+        self._request_status_lock = threading.Lock()
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_send_locks: Dict[str, threading.Lock] = {}
@@ -315,21 +319,24 @@ class CommonKVManager(BaseKVManager):
         return self.request_status[bootstrap_room]
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
-        if bootstrap_room not in self.request_status:
-            # Do not resurrect a cleared entry with Failed: once clear() has
-            # popped the room from request_status, any late update_status(Failed)
-            # (e.g. from abort()) must be a no-op. Otherwise a Failed entry could
-            # pollute a future request that reuses the same bootstrap_room.
-            if status == KVPoll.Failed:
-                return
-            self.request_status[bootstrap_room] = status
-        else:
-            if status == KVPoll.Failed:
+        with self._request_status_lock:
+            current = self.request_status.get(bootstrap_room)
+            if current is None:
+                # Do not resurrect a cleared entry with Failed: once clear() has
+                # popped the room from request_status, any late update_status(Failed)
+                # (e.g. from abort()) must be a no-op. Otherwise a Failed entry could
+                # pollute a future request that reuses the same bootstrap_room.
+                if status == KVPoll.Failed:
+                    return
+                self.request_status[bootstrap_room] = status
+            elif current == KVPoll.Failed or status == KVPoll.Failed:
+                # Failed is terminal until clear(). KVPoll.Failed is the smallest
+                # enum value, so max() would let a late Transferring/Success from
+                # another participant promote a failed room back to Success and
+                # authorize decode to commit a partial transfer.
                 self.request_status[bootstrap_room] = KVPoll.Failed
             else:
-                self.request_status[bootstrap_room] = max(
-                    self.request_status[bootstrap_room], status
-                )
+                self.request_status[bootstrap_room] = max(current, status)
 
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
@@ -1232,7 +1239,8 @@ class CommonKVSender(BaseKVSender):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        with self.kv_mgr._request_status_lock:
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "transfer_infos"):
@@ -1489,7 +1497,8 @@ class CommonKVReceiver(BaseKVReceiver):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        with self.kv_mgr._request_status_lock:
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
 
