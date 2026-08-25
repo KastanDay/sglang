@@ -158,7 +158,7 @@ from sglang.srt.utils.cudacore_pyspy_dump_utils import (
 )
 from sglang.srt.utils.failure_diagnostics import (
     FailureDiagnosticWriter,
-    strip_diagnostic_fields,
+    client_safe_finish_reason,
 )
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
@@ -1721,7 +1721,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         except Exception:
             pass
         finally:
-            strip_diagnostic_fields(finish_reason)
+            sanitized = client_safe_finish_reason(finish_reason)
+            finish_reason.clear()
+            finish_reason.update(sanitized)
 
     def emit_serving_exception(
         self, exception: Exception, request: Optional[fastapi.Request]
@@ -2087,9 +2089,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.model_update_lock.writer_lock if not is_paused else nullcontext()
         )
         async with lock_context:
-            success, message, num_paused_requests = (
-                await self._wait_for_model_update_from_disk(obj)
-            )
+            (
+                success,
+                message,
+                num_paused_requests,
+            ) = await self._wait_for_model_update_from_disk(obj)
 
         if success and obj.flush_cache and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
@@ -2651,8 +2655,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         # shared batch-output loop; degrade to nested instead.
                         state.input_top_logprobs_flat_fields = None
                         logger.error(
-                            "Falling back to nested input top logprobs for "
-                            "rid=%s: %s",
+                            "Falling back to nested input top logprobs for rid=%s: %s",
                             meta_info.get("id"),
                             e,
                         )
@@ -3128,7 +3131,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 filename = os.path.join(
                     self.crash_dump_folder,
                     hostname,
-                    f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl',
+                    f"crash_dump_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pkl",
                 )
                 os.makedirs(os.path.dirname(filename), exist_ok=True)
 

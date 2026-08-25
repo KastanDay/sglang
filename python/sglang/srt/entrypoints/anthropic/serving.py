@@ -203,6 +203,32 @@ class AnthropicServing:
             return None
         return getattr(tokenizer, "chat_template", None)
 
+    def _emit_serving_error(
+        self,
+        *,
+        status_code: int,
+        failure_stage: str,
+        error_kind: str,
+        exception: Exception,
+        request: Optional[Request],
+    ) -> None:
+        if getattr(exception, "sglang_failure_diagnostic_emitted", False):
+            return
+        tokenizer_manager = getattr(self.openai_serving_chat, "tokenizer_manager", None)
+        emitter = getattr(tokenizer_manager, "emit_serving_error", None)
+        if not callable(emitter):
+            return
+        try:
+            emitter(
+                status_code=status_code,
+                failure_stage=failure_stage,
+                error_kind=error_kind,
+                exception=exception,
+                request=request,
+            )
+        except Exception:
+            pass
+
     async def handle_messages(
         self,
         request: AnthropicMessagesRequest,
@@ -770,7 +796,7 @@ class AnthropicServing:
             raise
         except Exception as e:
             logger.exception("Error processing Anthropic request: %s", e)
-            self.openai_serving_chat.tokenizer_manager.emit_serving_error(
+            self._emit_serving_error(
                 status_code=500,
                 failure_stage="serving",
                 error_kind="anthropic_request_failed",
@@ -822,7 +848,7 @@ class AnthropicServing:
             raise
         except Exception as e:
             logger.exception("Error converting streaming request: %s", e)
-            self.openai_serving_chat.tokenizer_manager.emit_serving_error(
+            self._emit_serving_error(
                 status_code=500,
                 failure_stage="serving",
                 error_kind="anthropic_request_failed",
@@ -1483,7 +1509,7 @@ class AnthropicServing:
             raise
         except Exception as e:
             logger.exception("Error counting tokens: %s", e)
-            self.openai_serving_chat.tokenizer_manager.emit_serving_error(
+            self._emit_serving_error(
                 status_code=500,
                 failure_stage="tokenizer",
                 error_kind="token_count_failed",

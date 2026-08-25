@@ -263,10 +263,10 @@ class SchedulerRequestReceiver:
                     status_code=status_code,
                     failure_stage="multimodal" if is_internal_error else None,
                     error_kind=(
-                        "encoder_transfer_failed" if is_internal_error else None
+                        "multimodal_processing_failed" if is_internal_error else None
                     ),
                     diagnostic_cause_detail=(
-                        "Multimodal encoder transfer failed."
+                        "Multimodal input processing failed."
                         if is_internal_error
                         else None
                     ),

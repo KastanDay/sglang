@@ -1254,7 +1254,10 @@ def prepare_abort(
     failure_timeout_ms: Optional[int] = None,
 ):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
-    from sglang.srt.utils.failure_diagnostics import diagnostic_fields
+    from sglang.srt.utils.failure_diagnostics import (
+        bounded_exception_cause,
+        diagnostic_fields,
+    )
 
     # populate finish metadata and stream output
     req.finished_reason = FINISH_ABORT(
@@ -1267,7 +1270,11 @@ def prepare_abort(
             cause_detail=(
                 diagnostic_cause_detail
                 if diagnostic_cause_detail is not None
-                else str(exception) if exception is not None else None
+                else (
+                    bounded_exception_cause(exception)
+                    if exception is not None
+                    else None
+                )
             ),
             transfer_id=getattr(req, "bootstrap_room", None),
             transfer_state=transfer_state,

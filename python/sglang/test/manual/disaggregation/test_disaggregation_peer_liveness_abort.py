@@ -61,6 +61,7 @@ def _is_abort_result(status_code: int, body: Any) -> bool:
         for marker in (
             "pd peer failed",
             "prefill bootstrap failed",
+            "kv bootstrap failed",
             "abort",
             "aborted",
         )

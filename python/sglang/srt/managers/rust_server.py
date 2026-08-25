@@ -31,6 +31,7 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_serving,
 )
+from sglang.srt.utils.failure_diagnostics import client_safe_finish_reason
 from sglang.srt.utils.flatten import (
     FlatPairColumns,
     NestedRowColumns,
@@ -46,6 +47,13 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def _client_safe_finish_reasons(finish_reasons):
+    return [
+        client_safe_finish_reason(reason) if reason is not None else None
+        for reason in finish_reasons
+    ]
 
 
 class NativeMmSpec(msgspec.Struct, frozen=True, kw_only=True):
@@ -609,7 +617,9 @@ class RustServer:
         # always `array("i")` (never None) so `map(len)` and a bare
         # `chain.from_iterable` stay in C.
         rids = payload.rids
-        finish_reasons = payload.finished_reasons
+        # This bypasses TokenizerManager, so enforce the same client-facing
+        # finish-metadata boundary before Rust serializes OpenAI responses.
+        finish_reasons = _client_safe_finish_reasons(payload.finished_reasons)
         tok_lens = list(map(len, output_ids))
         flat_ids = array("i", chain.from_iterable(output_ids))
 

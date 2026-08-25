@@ -38,6 +38,13 @@ _UUID_RE = re.compile(
 _NUMBER_RE = re.compile(r"\b\d+\b")
 _WHITESPACE_RE = re.compile(r"\s+")
 
+_SENSITIVE_EXCEPTION_CAUSES = {
+    "JSONDecodeError": "JSON decoding failed.",
+    "UnicodeDecodeError": "Unicode decoding failed.",
+    "ValidationError": "Input validation failed.",
+    "ValueError": "Value validation failed.",
+}
+
 _FAILURE_STAGES = {
     "decode",
     "grammar",
@@ -58,6 +65,7 @@ _ERROR_KINDS = {
     "invalid_token",
     "metadata_mismatch",
     "metadata_not_ready",
+    "multimodal_processing_failed",
     "out_of_memory",
     "preempted",
     "priority_disabled",
@@ -92,6 +100,18 @@ def normalize_cause(value: str) -> str:
     return _WHITESPACE_RE.sub(" ", value).strip().lower()
 
 
+def bounded_exception_cause(exception: Exception) -> str:
+    """Keep useful unknown causes while suppressing known input-echo classes."""
+    exception_class = type(exception).__name__
+    if constant := _SENSITIVE_EXCEPTION_CAUSES.get(exception_class):
+        return constant
+    try:
+        cause = normalize_cause(str(exception))[:512]
+    except Exception:
+        cause = ""
+    return cause or "Internal exception without detail."
+
+
 def classify_transfer_error(exception: Optional[Exception], default: str) -> str:
     if exception is None:
         return default
@@ -119,9 +139,9 @@ def diagnostic_fields(
 ) -> Dict[str, Any]:
     """Return flat primitive fields safe for FinishReasonDict msgpack IPC."""
     if failure_stage is not None and failure_stage not in _FAILURE_STAGES:
-        raise ValueError(f"Unsupported failure stage: {failure_stage}")
+        failure_stage = "unknown"
     if error_kind is not None and error_kind not in _ERROR_KINDS:
-        raise ValueError(f"Unsupported error kind: {error_kind}")
+        error_kind = "unknown"
 
     values = {
         "failure_stage": failure_stage,
@@ -143,6 +163,13 @@ def strip_diagnostic_fields(finish_reason: Dict[str, Any]) -> None:
     for key in tuple(finish_reason):
         if key.startswith(DIAGNOSTIC_PREFIX):
             finish_reason.pop(key, None)
+
+
+def client_safe_finish_reason(finish_reason: Dict[str, Any]) -> Dict[str, Any]:
+    """Return finish metadata safe to cross a client-facing serving boundary."""
+    result = finish_reason.copy()
+    strip_diagnostic_fields(result)
+    return result
 
 
 class FailureDiagnosticWriter:
@@ -178,7 +205,22 @@ class FailureDiagnosticWriter:
             )
         except Exception:
             # Diagnostics must never alter or delay the serving response.
-            return "write_error", None
+            try:
+                status = int(finish_reason.get("status_code"))
+            except (TypeError, ValueError):
+                return "write_error", None
+            if status not in (500, 503) or outcome not in (
+                "http_error",
+                "stream_abort",
+            ):
+                return "write_error", None
+            return "write_error", {
+                "leg": self.role,
+                "failure_stage": "unknown",
+                "error_kind": "unknown",
+                "abort_status": status,
+                "outcome": outcome,
+            }
 
     def _emit_finish_reason(
         self,
@@ -188,7 +230,6 @@ class FailureDiagnosticWriter:
         request: Any,
         outcome: str,
     ) -> Tuple[str, Optional[Dict[str, Any]]]:
-
         try:
             status = int(finish_reason.get("status_code"))
         except (TypeError, ValueError):
@@ -220,8 +261,10 @@ class FailureDiagnosticWriter:
 
         stage = str(finish_reason.get(f"{DIAGNOSTIC_PREFIX}failure_stage") or "unknown")
         kind = str(finish_reason.get(f"{DIAGNOSTIC_PREFIX}error_kind") or "unknown")
-        if stage not in _FAILURE_STAGES or kind not in _ERROR_KINDS:
-            return "invalid_context", None
+        if stage not in _FAILURE_STAGES:
+            stage = "unknown"
+        if kind not in _ERROR_KINDS:
+            kind = "unknown"
         exception_class = str(
             finish_reason.get(f"{DIAGNOSTIC_PREFIX}exception_class") or ""
         )[:128]
