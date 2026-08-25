@@ -1,0 +1,33 @@
+python/sglang/srt/entrypoints/anthropic/serving.py
+  s_9127dd997df2f5::t_67b7c8fcc18a8b 773-779,825-831,1486-1492
+python/sglang/srt/entrypoints/openai/serving_tokenize.py
+  s_9127dd997df2f5::t_e0ec3614c33759 81-87,89,192-198,200
+python/sglang/srt/environ.py
+  s_9127dd997df2f5::t_34ab13b168fd8f 336
+python/sglang/srt/managers/scheduler.py
+  s_32266ff5eb2492::t_c3c431bc03c94b 326,1685-1692,2850-2854,2904-2912,2938-2944
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7fd846c39597f4d9c62074476538283087d55814",
+  "prompts": {},
+  "sessions": {
+    "s_32266ff5eb2492": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fc9ff54f3ffeb19qMYT2R9gjpk",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    },
+    "s_9127dd997df2f5": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fcab39a7bffe1xXX9WaZZdnQUK",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    }
+  }
+}
