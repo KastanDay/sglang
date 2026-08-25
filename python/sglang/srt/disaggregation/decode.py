@@ -100,6 +100,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
 )
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
+from sglang.srt.utils.failure_diagnostics import classify_transfer_error
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -894,9 +895,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 is_propagated = False
+                exc = None
                 try:
                     decode_req.kv_receiver.failure_exception()
                 except Exception as e:
+                    exc = e
                     error_message += f" with exception {e}"
                     is_propagated = getattr(e, "is_from_another_rank", False)
                 # Mute error message for propagated exceptions to avoid duplicate logging
@@ -906,8 +909,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     logger.error(error_message)
                 prepare_abort(
                     decode_req.req,
-                    error_message,
+                    "KV bootstrap failed.",
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    failure_stage="kv_bootstrap",
+                    error_kind=classify_transfer_error(exc, "handshake_failed"),
+                    exception=exc,
+                    diagnostic_cause_detail=(error_message if exc is None else None),
+                    transfer_state="failed",
                 )
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
@@ -1307,8 +1315,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     logger.error(reclaim_error)
                     prepare_abort(
                         decode_req.req,
-                        reclaim_error,
+                        "Request capacity became unavailable.",
                         status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                        failure_stage="decode",
+                        error_kind="swa_reclaim_failed",
+                        diagnostic_cause_detail=reclaim_error,
                     )
                     self.scheduler.output_streamer.stream_output(
                         [decode_req.req], decode_req.req.return_logprob
@@ -2089,9 +2100,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
             prepare_abort(
                 decode_req.req,
-                "Metadata unexpectedly not ready after readiness gate "
-                "(bootstrap_room=0)",
+                "KV transfer metadata was unavailable.",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                failure_stage="kv_transfer",
+                error_kind="metadata_not_ready",
+                diagnostic_cause_detail=(
+                    "Metadata was not ready after the transfer readiness gate."
+                ),
+                transfer_state="not_ready",
             )
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
@@ -2109,8 +2125,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             logger.error(error_msg)
             prepare_abort(
                 decode_req.req,
-                "Metadata corruption detected - bootstrap_room mismatch",
+                "KV transfer metadata was invalid.",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                failure_stage="kv_transfer",
+                error_kind="metadata_mismatch",
+                diagnostic_cause_detail="Transfer bootstrap room did not match.",
+                transfer_state="mismatch",
             )
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
@@ -2272,10 +2292,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 )
                 is_propagated = False
+                exc = None
                 if poll == KVPoll.Failed:
                     try:
                         decode_req.kv_receiver.failure_exception()
                     except Exception as e:
+                        exc = e
                         error_message += f" with exception {e}"
                         is_propagated = getattr(e, "is_from_another_rank", False)
                 self._clean_hicache_prefetch_resources(decode_req)
@@ -2286,8 +2308,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     logger.error(error_message)
                 prepare_abort(
                     decode_req.req,
-                    error_message,
+                    "KV transfer failed.",
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    failure_stage="kv_transfer",
+                    error_kind=classify_transfer_error(exc, "transfer_failed"),
+                    exception=exc,
+                    diagnostic_cause_detail=(error_message if exc is None else None),
+                    transfer_state="failed",
                 )
                 self.scheduler.output_streamer.stream_output(
                     [decode_req.req],

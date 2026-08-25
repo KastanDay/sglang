@@ -156,6 +156,10 @@ from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     pyspy_dump_schedulers,
     trigger_cuda_user_coredump,
 )
+from sglang.srt.utils.failure_diagnostics import (
+    FailureDiagnosticWriter,
+    strip_diagnostic_fields,
+)
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -450,6 +454,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Init metric collector and watchdog
         self.init_metric_collector_watchdog()
+        self.failure_diagnostic_writer = FailureDiagnosticWriter(
+            self.disaggregation_mode.value
+        )
 
         # Init request dispatcher
         self.init_request_dispatcher()
@@ -1677,13 +1684,79 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self.enable_lora and state.obj.lora_path:
                 await self.lora_registry.release(state.obj.lora_id)
             if not is_stream:
-                raise fastapi.HTTPException(
+                exception = fastapi.HTTPException(
                     status_code=finish_reason["status_code"],
                     detail=finish_reason["message"],
                 )
+                setattr(exception, "sglang_failure_diagnostic_emitted", True)
+                raise exception
             return out
 
         return None
+
+    def _consume_failure_diagnostic(
+        self,
+        *,
+        finish_reason: dict,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        request: Optional[fastapi.Request],
+        is_stream: bool,
+    ) -> None:
+        try:
+            if finish_reason.get("type") != "abort" or finish_reason.get(
+                "status_code"
+            ) not in (
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            ):
+                return
+            result, event = self.failure_diagnostic_writer.emit_finish_reason(
+                finish_reason=finish_reason,
+                rid=obj.rid,
+                request=request,
+                outcome="stream_abort" if is_stream else "http_error",
+            )
+            if self.enable_metrics and event is not None:
+                self.metrics_collector.observe_inference_failure(event, result)
+        except Exception:
+            pass
+        finally:
+            strip_diagnostic_fields(finish_reason)
+
+    def emit_serving_exception(
+        self, exception: Exception, request: Optional[fastapi.Request]
+    ) -> None:
+        try:
+            result, event = self.failure_diagnostic_writer.emit_exception(
+                exception=exception,
+                request=request,
+            )
+            if self.enable_metrics and event is not None:
+                self.metrics_collector.observe_inference_failure(event, result)
+        except Exception:
+            pass
+
+    def emit_serving_error(
+        self,
+        *,
+        status_code: int,
+        failure_stage: str,
+        error_kind: str,
+        exception: Exception,
+        request: Optional[fastapi.Request],
+    ) -> None:
+        try:
+            result, event = self.failure_diagnostic_writer.emit_serving_error(
+                status_code=status_code,
+                failure_stage=failure_stage,
+                error_kind=error_kind,
+                exception=exception,
+                request=request,
+            )
+            if self.enable_metrics and event is not None:
+                self.metrics_collector.observe_inference_failure(event, result)
+        except Exception:
+            pass
 
     async def _wait_one_response(
         self,
@@ -1743,6 +1816,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 out["text"] = state.get_text()
 
             if finished:
+                finish_reason = out.get("meta_info", {}).get("finish_reason")
+                if isinstance(finish_reason, dict):
+                    self._consume_failure_diagnostic(
+                        finish_reason=finish_reason,
+                        obj=obj,
+                        request=request,
+                        is_stream=is_stream,
+                    )
+
                 # Record response sent time right before we log finished results and metrics.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()

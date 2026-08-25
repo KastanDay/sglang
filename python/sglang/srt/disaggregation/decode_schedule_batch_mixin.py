@@ -10,6 +10,7 @@ from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.utils.failure_diagnostics import diagnostic_fields
 
 logger = logging.getLogger(__name__)
 
@@ -129,13 +130,25 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 except ValueError as e:
                     from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
+                    logger.error(
+                        "Grammar accept_token failed for req %s with token %s: %s",
+                        req.rid,
+                        req.output_ids[-1],
+                        e,
+                    )
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.
                     # Use to_finish (not finished_reason) so that process_batch_result_prebuilt
                     # handles the release via update_finish_state -> release_kv_cache in one place.
-                    error_message = f"Grammar accept_token failed for req {req.rid} with token {req.output_ids[-1]}: {e}"
                     req.to_finish = FINISH_ABORT(
-                        error_message, HTTPStatus.INTERNAL_SERVER_ERROR
+                        "Internal grammar processing failed.",
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        diagnostic_fields=diagnostic_fields(
+                            failure_stage="grammar",
+                            error_kind="invalid_token",
+                            exception_class=type(e).__name__,
+                            cause_detail="Grammar rejected a generated token.",
+                        ),
                     )
                 req.grammar.finished = req.finished()
         last_tokens_tensor = torch.tensor(

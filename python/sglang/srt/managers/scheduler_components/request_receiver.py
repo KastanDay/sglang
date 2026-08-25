@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -33,6 +34,8 @@ from sglang.srt.utils import (
     point_to_point_pyobj,
 )
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -244,7 +247,30 @@ class SchedulerRequestReceiver:
                     status_code = error_code
                 else:
                     status_code = HTTPStatus(int(error_code))
-                prepare_abort(req, error_msg, status_code=status_code)
+                is_internal_error = status_code in (
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                if is_internal_error:
+                    logger.error("Multimodal input processing failed: %s", error_msg)
+                prepare_abort(
+                    req,
+                    (
+                        "Multimodal input processing failed."
+                        if is_internal_error
+                        else error_msg
+                    ),
+                    status_code=status_code,
+                    failure_stage="multimodal" if is_internal_error else None,
+                    error_kind=(
+                        "encoder_transfer_failed" if is_internal_error else None
+                    ),
+                    diagnostic_cause_detail=(
+                        "Multimodal encoder transfer failed."
+                        if is_internal_error
+                        else None
+                    ),
+                )
                 self.stream_output([req], req.return_logprob)
         return recv_reqs
 

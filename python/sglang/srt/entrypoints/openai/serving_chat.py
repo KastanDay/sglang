@@ -1827,6 +1827,7 @@ class OpenAIServingChat(OpenAIServingBase):
             request,
             ret,
             int(time.time()),
+            raw_request,
         )
 
         return response
@@ -1836,6 +1837,7 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         ret: List[Dict[str, Any]],
         created: int,
+        raw_request: Optional[Request] = None,
     ) -> Union[ChatCompletionResponse, ORJSONResponse]:
         """Build chat completion response from generation results"""
         if self.chat_encoding_spec == "kimi_k3":
@@ -1918,6 +1920,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     reasoning_text, text = parser.parse_non_stream(text)
                 except Exception as e:
                     logger.error(f"Reasoning parsing error: {e}")
+                    self.tokenizer_manager.emit_serving_error(
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        failure_stage="serving",
+                        error_kind="reasoning_parse_failed",
+                        exception=e,
+                        request=raw_request,
+                    )
                     return self.create_error_response(
                         "Failed to parse reasoning content",
                         err_type="InternalServerError",

@@ -19,6 +19,7 @@ from sglang.srt.utils.common import (
     flatten_arrays_to_pinned_cpu,
     is_pin_memory_available,
 )
+from sglang.srt.utils.failure_diagnostics import diagnostic_fields
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
     truncate_weight_version_events,
@@ -280,11 +281,14 @@ class FINISH_LENGTH(BaseFinishReason):
 
 
 class FINISH_ABORT(BaseFinishReason):
-    def __init__(self, message=None, status_code=None, err_type=None):
+    def __init__(
+        self, message=None, status_code=None, err_type=None, diagnostic_fields=None
+    ):
         super().__init__()
         self.message = message or "Aborted"
         self.status_code = status_code
         self.err_type = err_type
+        self.diagnostic_fields = diagnostic_fields or {}
 
     def to_json(self):
         return {
@@ -292,6 +296,7 @@ class FINISH_ABORT(BaseFinishReason):
             "message": self.message,
             "status_code": self.status_code,
             "err_type": self.err_type,
+            **self.diagnostic_fields,
         }
 
 
@@ -2883,8 +2888,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # The retraction host pool could not hold the backup and the
                 # device KV is already freed, so the request cannot resume.
                 req.to_finish = FINISH_ABORT(
-                    "Retraction host KV pool exhausted. Aborting the request.",
+                    "Request memory became unavailable.",
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    diagnostic_fields=diagnostic_fields(
+                        failure_stage="decode",
+                        error_kind="retraction_host_exhausted",
+                        cause_detail="Retraction host KV pool was exhausted.",
+                    ),
                 )
                 reqs_to_abort.append(req)
                 logger.warning(
@@ -2901,9 +2911,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             last_idx = sorted_indices.pop()
             last_req = self.reqs[last_idx]
             last_req.to_finish = FINISH_ABORT(
-                "Out of memory even after retracting all other requests "
-                "in the decode batch. Aborting the last request.",
+                "Request memory became unavailable.",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                diagnostic_fields=diagnostic_fields(
+                    failure_stage="decode",
+                    error_kind="out_of_memory",
+                    cause_detail=(
+                        "Decode KV memory remained exhausted after retraction."
+                    ),
+                ),
             )
             reqs_to_abort.append(last_req)
             self.release_req(last_idx, 0, server_args, offload_kv=False)

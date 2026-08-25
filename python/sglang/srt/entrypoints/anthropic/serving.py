@@ -770,6 +770,13 @@ class AnthropicServing:
             raise
         except Exception as e:
             logger.exception("Error processing Anthropic request: %s", e)
+            self.openai_serving_chat.tokenizer_manager.emit_serving_error(
+                status_code=500,
+                failure_stage="serving",
+                error_kind="anthropic_request_failed",
+                exception=e,
+                request=raw_request,
+            )
             return self._error_response(
                 status_code=500,
                 error_type="api_error",
@@ -815,6 +822,13 @@ class AnthropicServing:
             raise
         except Exception as e:
             logger.exception("Error converting streaming request: %s", e)
+            self.openai_serving_chat.tokenizer_manager.emit_serving_error(
+                status_code=500,
+                failure_stage="serving",
+                error_kind="anthropic_request_failed",
+                exception=e,
+                request=raw_request,
+            )
             return self._error_response(
                 status_code=500,
                 error_type="api_error",
@@ -1469,6 +1483,13 @@ class AnthropicServing:
             raise
         except Exception as e:
             logger.exception("Error counting tokens: %s", e)
+            self.openai_serving_chat.tokenizer_manager.emit_serving_error(
+                status_code=500,
+                failure_stage="tokenizer",
+                error_kind="token_count_failed",
+                exception=e,
+                request=raw_request,
+            )
             return self._error_response(
                 status_code=500,
                 error_type="api_error",

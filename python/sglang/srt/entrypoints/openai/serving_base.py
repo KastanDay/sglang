@@ -4,6 +4,7 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import orjson
@@ -108,6 +109,17 @@ class OpenAIServingBase(ABC):
                     adapted_request, processed_request, raw_request
                 )
         except HTTPException as e:
+            if e.status_code in (
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            ) and not getattr(e, "sglang_failure_diagnostic_emitted", False):
+                self.tokenizer_manager.emit_serving_error(
+                    status_code=e.status_code,
+                    failure_stage="serving",
+                    error_kind="unhandled_exception",
+                    exception=e,
+                    request=raw_request,
+                )
             return self.create_error_response(
                 message=e.detail, err_type=str(e.status_code), status_code=e.status_code
             )
@@ -126,8 +138,9 @@ class OpenAIServingBase(ABC):
             )
         except Exception as e:
             logger.exception(f"Error in request: {e}")
+            self.tokenizer_manager.emit_serving_exception(e, raw_request)
             return self.create_error_response(
-                message=f"Internal server error: {str(e)}",
+                message="Internal server error.",
                 err_type="InternalServerError",
                 status_code=500,
             )

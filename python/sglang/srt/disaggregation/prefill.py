@@ -75,6 +75,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.failure_diagnostics import classify_transfer_error
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 
 if TYPE_CHECKING:
@@ -766,10 +767,15 @@ class SchedulerDisaggregationPrefillMixin:
                         req.grammar.accept_token(next_token_id)
                     except ValueError as e:
                         error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                        logger.error(error_message)
                         prepare_abort(
                             req,
-                            error_message,
+                            "Internal grammar processing failed.",
                             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                            failure_stage="grammar",
+                            error_kind="invalid_token",
+                            exception=e,
+                            diagnostic_cause_detail="Grammar rejected a generated token.",
                         )
                     req.grammar.finished = req.finished()
             else:
@@ -967,7 +973,14 @@ class SchedulerDisaggregationPrefillMixin:
         release_kv_cache(req, self.tree_cache)  # unlock the tree
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
-                req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                req,
+                "KV transfer failed.",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                failure_stage="kv_transfer",
+                error_kind=classify_transfer_error(exc, "transfer_failed"),
+                exception=exc,
+                diagnostic_cause_detail=(error_message if exc is None else None),
+                transfer_state="failed",
             )
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
@@ -989,9 +1002,11 @@ class SchedulerDisaggregationPrefillMixin:
             f"{req.rid=} {req.bootstrap_room=}"
         )
         is_propagated = False
+        exc = None
         try:
             req.disagg_kv_sender.failure_exception()
         except Exception as e:
+            exc = e
             error_message += f" with exception {e}"
             is_propagated = getattr(e, "is_from_another_rank", False)
         # Mute error message for propagated exceptions to avoid duplicate logging
@@ -1008,7 +1023,16 @@ class SchedulerDisaggregationPrefillMixin:
             release_kv_cache(req, self.tree_cache)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
-        prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        prepare_abort(
+            req,
+            "KV bootstrap failed.",
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            failure_stage="kv_bootstrap",
+            error_kind=classify_transfer_error(exc, "bootstrap_failed"),
+            exception=exc,
+            diagnostic_cause_detail=(error_message if exc is None else None),
+            transfer_state="failed",
+        )
         self.output_streamer.stream_output([req], req.return_logprob)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()

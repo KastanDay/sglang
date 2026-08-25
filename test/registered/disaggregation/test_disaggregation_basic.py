@@ -371,7 +371,7 @@ class TestDisaggregationMooncakeSpec(
                 else response.text
             ),
         )
-        self.assertIn("Retraction host KV pool exhausted", response.text)
+        self.assertIn("Request memory became unavailable", response.text)
         for neighbour in neighbours:
             self.assertEqual(neighbour.status_code, 200, neighbour.text)
 

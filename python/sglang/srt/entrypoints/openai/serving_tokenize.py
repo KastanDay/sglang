@@ -78,8 +78,15 @@ class OpenAIServingTokenize(OpenAIServingBase):
             return self.create_error_response(str(e))
         except Exception as e:
             logger.error("Error during tokenization", exc_info=True)
+            self.tokenizer_manager.emit_serving_error(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                failure_stage="tokenizer",
+                error_kind="tokenization_failed",
+                exception=e,
+                request=raw_request,
+            )
             return self.create_error_response(
-                f"Internal server error during tokenization: {e}",
+                "Internal server error during tokenization.",
                 err_type="InternalServerError",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
@@ -182,8 +189,15 @@ class OpenAIServingDetokenize(OpenAIServingBase):
                     err_type="DecodeError",
                     status_code=HTTPStatus.BAD_REQUEST,
                 )
+            self.tokenizer_manager.emit_serving_error(
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                failure_stage="tokenizer",
+                error_kind="detokenization_failed",
+                exception=e,
+                request=raw_request,
+            )
             return self.create_error_response(
-                f"Internal server error during detokenization: {e}",
+                "Internal server error during detokenization.",
                 err_type="InternalServerError",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )

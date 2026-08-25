@@ -323,6 +323,7 @@ from sglang.srt.utils import (
     triton_load_watch,
 )
 from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.failure_diagnostics import diagnostic_fields
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -1681,7 +1682,14 @@ class Scheduler(
         for req in running_batch.reqs:
             if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
                 req.to_finish = FINISH_ABORT(
-                    "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
+                    "Request could not be completed in time.",
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    diagnostic_fields=diagnostic_fields(
+                        failure_stage="scheduler",
+                        error_kind="running_timeout",
+                        cause_detail="Request running timeout reached.",
+                        failure_timeout_ms=int(timeout_s * 1000),
+                    ),
                 )
 
     def get_init_info(self) -> Dict[str, Any]:
@@ -2839,6 +2847,11 @@ class Scheduler(
                     "type": "abort",
                     "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
                     "message": "Using priority is disabled for this server. Please send a new request without a priority.",
+                    **diagnostic_fields(
+                        failure_stage="scheduler",
+                        error_kind="priority_disabled",
+                        cause_detail="Request priority is disabled.",
+                    ),
                 },
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
@@ -2888,6 +2901,15 @@ class Scheduler(
                     "type": "abort",
                     "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
                     "message": message,
+                    **diagnostic_fields(
+                        failure_stage="scheduler",
+                        error_kind=(
+                            "preempted"
+                            if req_to_abort is not recv_req
+                            else "queue_full"
+                        ),
+                        cause_detail=message,
+                    ),
                 },
             ),
             req_to_abort,
@@ -2913,7 +2935,13 @@ class Scheduler(
                         finished_reason={
                             "type": "abort",
                             "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                            "message": "Request waiting timeout reached.",
+                            "message": "Request could not be completed in time.",
+                            **diagnostic_fields(
+                                failure_stage="scheduler",
+                                error_kind="waiting_timeout",
+                                cause_detail="Request waiting timeout reached.",
+                                failure_timeout_ms=int(timeout_s * 1000),
+                            ),
                         },
                     ),
                     req,

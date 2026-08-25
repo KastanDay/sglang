@@ -1626,6 +1626,24 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             documentation="Number of requests aborted.",
             labelnames=labels.keys(),
         )
+        self.inference_failures_total = Counter(
+            name="sglang:inference_failures_total",
+            documentation="Number of failed runtime sub-requests.",
+            labelnames=list(labels.keys())
+            + ["leg", "failure_stage", "error_kind", "abort_status", "outcome"],
+        )
+        self.diagnostic_events_total = Counter(
+            name="sglang:diagnostic_events_total",
+            documentation="Inference failure diagnostic writer attempts.",
+            labelnames=list(labels.keys()) + ["event", "result"],
+        )
+        self.diagnostics_build_info = Gauge(
+            name="sglang:diagnostics_build_info",
+            documentation="Failure diagnostic schema included in this build.",
+            labelnames=list(labels.keys()) + ["schema_version"],
+            multiprocess_mode="mostrecent",
+        )
+        self.diagnostics_build_info.labels(**labels, schema_version="1").set(1)
 
         if bucket_time_to_first_token is None:
             bucket_time_to_first_token = [
@@ -1843,6 +1861,22 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
 
     def observe_one_aborted_request(self, labels: Dict[str, str]):
         self.num_aborted_requests_total.labels(**labels).inc(1)
+
+    def observe_inference_failure(self, event: Dict[str, Any], result: str) -> None:
+        self.inference_failures_total.labels(
+            **self.labels,
+            leg=event["leg"],
+            failure_stage=event["failure_stage"],
+            error_kind=event["error_kind"],
+            abort_status=str(event["abort_status"]),
+            outcome=event["outcome"],
+        ).inc()
+        if result != "disabled":
+            self.diagnostic_events_total.labels(
+                **self.labels,
+                event="inference_failure",
+                result=result,
+            ).inc()
 
 
 @dataclass

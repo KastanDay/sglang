@@ -1241,11 +1241,39 @@ def setup_state_kv_args(
             )
 
 
-def prepare_abort(req: Req, error_message: str, status_code=None):
+def prepare_abort(
+    req: Req,
+    error_message: str,
+    status_code=None,
+    *,
+    failure_stage: Optional[str] = None,
+    error_kind: Optional[str] = None,
+    exception: Optional[Exception] = None,
+    diagnostic_cause_detail: Optional[str] = None,
+    transfer_state: Optional[str] = None,
+    failure_timeout_ms: Optional[int] = None,
+):
     from sglang.srt.managers.schedule_batch import FINISH_ABORT
+    from sglang.srt.utils.failure_diagnostics import diagnostic_fields
 
     # populate finish metadata and stream output
-    req.finished_reason = FINISH_ABORT(error_message, status_code)
+    req.finished_reason = FINISH_ABORT(
+        error_message,
+        status_code,
+        diagnostic_fields=diagnostic_fields(
+            failure_stage=failure_stage,
+            error_kind=error_kind,
+            exception_class=type(exception).__name__ if exception is not None else None,
+            cause_detail=(
+                diagnostic_cause_detail
+                if diagnostic_cause_detail is not None
+                else str(exception) if exception is not None else None
+            ),
+            transfer_id=getattr(req, "bootstrap_room", None),
+            transfer_state=transfer_state,
+            failure_timeout_ms=failure_timeout_ms,
+        ),
+    )
 
     if req.return_logprob:
         req.logprob.input_token_logprobs_val = []
