@@ -1,0 +1,35 @@
+python/sglang/srt/disaggregation/utils.py
+  s_32266ff5eb2492::t_c3fbaf639142a3 1257-1260,1273-1277
+python/sglang/srt/managers/rust_server.py
+  s_32266ff5eb2492::t_7c386493b5cdee 34,52-58,620-622
+python/sglang/srt/managers/tokenizer_manager.py
+  s_32266ff5eb2492::t_cfdeea9cd9e5b2 161,1724-1726,2092-2096,2658,3134
+python/sglang/srt/utils/failure_diagnostics.py
+  s_9127dd997df2f5::t_fa67e7bdfcbd3e 41-47,68,103-114,142,144,168-174,208-223,264-267
+test/registered/unit/observability/test_failure_diagnostics.py
+  s_32266ff5eb2492::t_b41d9a0821ff78 6-8,11,18,20,73-91,109,177-242,284-316,326-327,337-376
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0e0dfcc3674f8339594cee317ef9b0386aa10a5e",
+  "prompts": {},
+  "sessions": {
+    "s_32266ff5eb2492": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fc9ff54f3ffeb19qMYT2R9gjpk",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    },
+    "s_9127dd997df2f5": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fcab39a7bffe1xXX9WaZZdnQUK",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    }
+  }
+}
