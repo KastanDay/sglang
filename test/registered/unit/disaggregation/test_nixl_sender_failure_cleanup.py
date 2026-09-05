@@ -26,6 +26,7 @@ class TestNixlSenderFailureCleanup(unittest.TestCase):
             enable_staging=True,
             _staging_ctx=staging_ctx,
             request_status={room: object()},
+            _request_status_lock=threading.Lock(),
             req_to_decode_prefix_len={room: 3},
             transfer_infos={room: object()},
             exceptions={room: expected_exc},

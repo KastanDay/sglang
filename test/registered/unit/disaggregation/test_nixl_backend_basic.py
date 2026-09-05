@@ -343,6 +343,7 @@ class TestNixlKVSenderChunkPolicy(CustomTestCase):
 class TestNixlAbortHandling(CustomTestCase):
     def _make_manager(self, request_status=None):
         mgr = object.__new__(NixlKVManager)
+        mgr._request_status_lock = threading.Lock()
         mgr.request_status = dict(request_status or {})
         mgr._connect = MagicMock()
         mgr.failure_lock = threading.Lock()
@@ -409,6 +410,7 @@ class TestNixlAbortHandling(CustomTestCase):
 class TestNixlUpdateStatus(CustomTestCase):
     def _make_manager(self, request_status):
         mgr = object.__new__(NixlKVManager)
+        mgr._request_status_lock = threading.Lock()
         mgr.request_status = dict(request_status)
         return mgr
 
@@ -434,6 +436,7 @@ class TestNixlUpdateStatus(CustomTestCase):
 class TestNixlTransferWorker(CustomTestCase):
     def _make_manager(self, room):
         mgr = object.__new__(NixlKVManager)
+        mgr._request_status_lock = threading.Lock()
         mgr.request_status = {room: KVPoll.WaitingForInput}
         mgr.transfer_infos = {
             room: {
@@ -625,6 +628,7 @@ class TestNixlTransferWorker(CustomTestCase):
 class TestNixlNotifications(CustomTestCase):
     def _make_manager(self, messages, required=None):
         mgr = object.__new__(NixlKVManager)
+        mgr._request_status_lock = threading.Lock()
         mgr.agent = NotificationFakeAgent(messages)
         mgr.transfer_statuses = defaultdict(TransferStatus)
         mgr.required_prefill_response_num_table = required or {}
@@ -773,6 +777,7 @@ class TestNixlReceiverPoll(CustomTestCase):
 class TestNixlNodeFailure(CustomTestCase):
     def _make_manager(self):
         mgr = object.__new__(NixlKVManager)
+        mgr._request_status_lock = threading.Lock()
         mgr.connection_lock = threading.Lock()
         # Connection keys are "{addr}_{dp_rank}_{cp_rank}_{tp_rank}".
         mgr.connection_pool = {
@@ -819,6 +824,7 @@ class TestNixlNodeFailure(CustomTestCase):
 
     def test_late_failed_update_does_not_resurrect_cleared_room(self):
         mgr = object.__new__(CommonKVManager)
+        mgr._request_status_lock = threading.Lock()
         mgr.request_status = {}
 
         CommonKVManager.update_status(mgr, 9, KVPoll.Failed)
@@ -829,6 +835,7 @@ class TestNixlNodeFailure(CustomTestCase):
 class TestNixlStaging(CustomTestCase):
     def _make_manager(self, agent=None):
         mgr = object.__new__(NixlKVManager)
+        mgr._request_status_lock = threading.Lock()
         mgr.agent = agent or StagingFakeAgent()
         mgr.attn_tp_size = 2
         mgr.is_mla_backend = False
