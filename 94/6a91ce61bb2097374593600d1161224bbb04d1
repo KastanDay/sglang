@@ -1,0 +1,91 @@
+python/sglang/srt/constrained/reasoner_grammar_backend.py
+  s_db41684c0cb7d5::t_5af4a5dc750370 115
+python/sglang/srt/disaggregation/common/conn.py
+  s_db41684c0cb7d5::t_f31fcb97971d72 1033-1038,1096-1102,1109,1111-1115,1134-1140
+python/sglang/srt/disaggregation/decode.py
+  s_db41684c0cb7d5::t_6db138de70e5e2 717-719,831-838,1088-1092,1425-1428,1814-1826,1845
+python/sglang/srt/disaggregation/decode.py.orig
+  s_db41684c0cb7d5::t_c74902b4333fc4 1-1989
+python/sglang/srt/disaggregation/decode_schedule_batch_mixin.py
+  s_db41684c0cb7d5::t_451648a8f3282b 132-134
+python/sglang/srt/disaggregation/mooncake/conn.py
+  s_db41684c0cb7d5::t_cb7e4d6cda889c 15-16,66-122,1234-1236,1449-1472,1474-1498,1507-1513,1885,1920-1923,1939-1940,1942-1952,1981-1984,1999-2007,2009-2011
+python/sglang/srt/disaggregation/mooncake/conn.py.orig
+  s_db41684c0cb7d5::t_e447f50c9ec155 1-1905
+python/sglang/srt/disaggregation/mori/conn.py
+  s_db41684c0cb7d5::t_84d85e4a05d6c7 1627,1629,1647-1672,1674-1677,1708-1729,1731-1733
+python/sglang/srt/disaggregation/nixl/conn.py
+  s_db41684c0cb7d5::t_575072f5bae856 15,2037-2058,2060-2062,2098,2132-2162,2164-2167
+python/sglang/srt/environ.py
+  s_db41684c0cb7d5::t_729d943a804863 305
+python/sglang/srt/managers/detokenizer_manager.py
+  s_db41684c0cb7d5::t_9ed0ae6ab83581 20,149-167,184,188-192
+python/sglang/srt/managers/multi_tokenizer_mixin.py
+  s_db41684c0cb7d5::t_a9dac44c35c073 336,339,341-355
+python/sglang/srt/managers/multi_tokenizer_mixin.py.orig
+  s_db41684c0cb7d5::t_add2c04edc3e19 1-747
+python/sglang/srt/managers/schedule_batch.py
+  s_db41684c0cb7d5::t_ea32d71d5bc716 666-694,1644,1648,1650-1659,1667,2309-2327,2538,2551-2564,2594,2688-2705,2773-2780
+python/sglang/srt/managers/schedule_batch.py.orig
+  s_db41684c0cb7d5::t_7051837973d165 1-2997
+python/sglang/srt/managers/scheduler.py
+  s_db41684c0cb7d5::t_75822572361b55 2276-2294,3851-3853
+python/sglang/srt/managers/scheduler.py.orig
+  s_db41684c0cb7d5::t_f8f7be5af8810a 1-4266
+python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+  s_db41684c0cb7d5::t_9cd07bea022621 150-155
+python/sglang/srt/managers/tokenizer_manager.py
+  s_db41684c0cb7d5::t_1d3214e62b446c 546-551,553-557,1846-1847,2302
+python/sglang/srt/managers/tokenizer_manager.py.orig
+  s_db41684c0cb7d5::t_efbb5dd58212e6 1-3117
+python/sglang/srt/mem_cache/allocator/base.py
+  s_db41684c0cb7d5::t_a22bb5c521ed26 50-53
+python/sglang/srt/mem_cache/allocator/paged.py
+  s_db41684c0cb7d5::t_45453dfee2fd8a 237
+python/sglang/srt/mem_cache/kv_integrity.py
+  s_db41684c0cb7d5::t_92d16b4ebbf95b 1-281
+python/sglang/srt/mem_cache/memory_pool.py
+  s_db41684c0cb7d5::t_dd2b485fe3d743 257-260,296
+python/sglang/srt/mem_cache/memory_pool.py.orig
+  s_db41684c0cb7d5::t_8dd4e27b2b2f60 1-2745
+python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+  s_db41684c0cb7d5::t_3f789697d76c84 4,953-990
+python/sglang/srt/multimodal/processors/base_processor.py
+  s_db41684c0cb7d5::t_bd6ed06f68c0cb 13,48-51,549-563,570-572,577-579,941-947,1086,1089-1090
+python/sglang/srt/observability/req_time_stats.py
+  s_db41684c0cb7d5::t_3c267f4207c348 979,985,987,995-997
+python/sglang/srt/observability/req_time_stats.py.orig
+  s_db41684c0cb7d5::t_2e3989d7fb2bf7 1-1235
+python/sglang/srt/speculative/eagle_info_v2.py
+  s_db41684c0cb7d5::t_8c9982c99364be 104-115
+python/sglang/srt/speculative/eagle_info_v2.py.orig
+  s_db41684c0cb7d5::t_53f11b4c76d1fc 1-111
+python/sglang/srt/speculative/eagle_utils.py
+  s_db41684c0cb7d5::t_71a1dae25b0fe4 318-330
+python/sglang/srt/speculative/eagle_utils.py.orig
+  s_db41684c0cb7d5::t_219604949182ee 1-563
+python/sglang/srt/speculative/ngram_worker.py
+  s_db41684c0cb7d5::t_2124664045b04a 334-346
+python/sglang/srt/speculative/ngram_worker.py.orig
+  s_db41684c0cb7d5::t_3ed00fafed9b68 1-521
+python/sglang/srt/utils/common.py
+  s_db41684c0cb7d5::t_806f608a307c59 3358-3369,3372-3411,3420-3423
+python/sglang/srt/utils/common.py.orig
+  s_db41684c0cb7d5::t_86a094758da321 1-4233
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "946a91ce61bb2097374593600d1161224bbb04d1",
+  "prompts": {},
+  "sessions": {
+    "s_db41684c0cb7d5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a1d6-08a1-75f2-a1ee-285d1bf27153",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    }
+  }
+}
