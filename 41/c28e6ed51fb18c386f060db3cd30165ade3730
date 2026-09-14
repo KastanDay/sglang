@@ -1,0 +1,113 @@
+python/sglang/srt/constrained/base_grammar_backend.py
+  s_db41684c0cb7d5::t_cb9f15e2fad251 311-313
+python/sglang/srt/constrained/reasoner_grammar_backend.py
+  s_db41684c0cb7d5::t_c667d9b11b5472 56,68,117,135-142,144-146,161-177,201-210,254,273,278-282,284,324
+python/sglang/srt/constrained/reasoner_grammar_backend.py.orig
+  s_db41684c0cb7d5::t_8742cdf15ae128 1-320
+python/sglang/srt/disaggregation/common/conn.py
+  s_db41684c0cb7d5::t_e875240db6a4df 1033-1038,1096-1102,1109,1111-1115,1134-1140
+python/sglang/srt/disaggregation/decode.py
+  s_db41684c0cb7d5::t_70c6e4e3ecf356 717-719,831-838,1088-1092,1425-1428,1814-1826,1845
+python/sglang/srt/disaggregation/decode.py.orig
+  s_db41684c0cb7d5::t_6875ca1bee8e6a 1-1989
+python/sglang/srt/disaggregation/decode_schedule_batch_mixin.py
+  s_db41684c0cb7d5::t_e94f0aba7c5d20 132-134
+python/sglang/srt/disaggregation/mooncake/conn.py
+  s_db41684c0cb7d5::t_deff4ca559193d 15-16,66-122,1234-1236,1449-1472,1474-1498,1507-1513,1885,1920-1923,1939-1940,1942-1952,1981-1984,1999-2007,2009-2011
+python/sglang/srt/disaggregation/mooncake/conn.py.orig
+  s_db41684c0cb7d5::t_7210336d1e5b1a 1-1905
+python/sglang/srt/disaggregation/mori/conn.py
+  s_db41684c0cb7d5::t_1a621453d0024e 1627,1629,1647-1672,1674-1677,1708-1729,1731-1733
+python/sglang/srt/disaggregation/nixl/conn.py
+  s_db41684c0cb7d5::t_bec3af4b7e8ac9 15,2037-2058,2060-2062,2098,2132-2162,2164-2167
+python/sglang/srt/disaggregation/prefill.py
+  s_db41684c0cb7d5::t_99db7e89c1dc0e 764-765,786-791
+python/sglang/srt/environ.py
+  s_db41684c0cb7d5::t_18941210614edf 305
+python/sglang/srt/function_call/gemma4_detector.py
+  s_db41684c0cb7d5::t_ec64dceeed2c85 91-95,108-109
+python/sglang/srt/function_call/kimik2_detector.py
+  s_db41684c0cb7d5::t_ecfbb7fb93c46c 179-184,187,197,202,214,217-226,231,233,235-256,258-260,262-277,279-307,309,312,314-330,332-334,337-341,343-346,348-350,354-414
+python/sglang/srt/managers/detokenizer_manager.py
+  s_db41684c0cb7d5::t_660cf1dd115c77 20,149-167,184,188-192
+python/sglang/srt/managers/multi_tokenizer_mixin.py
+  s_db41684c0cb7d5::t_8086977a03d8fe 336,339,341-355
+python/sglang/srt/managers/multi_tokenizer_mixin.py.orig
+  s_db41684c0cb7d5::t_2e38bec4012cb8 1-747
+python/sglang/srt/managers/schedule_batch.py
+  s_db41684c0cb7d5::t_8e93c8079d40da 257,301-303,315,322-331,681-709,1659,1663,1665-1674,1682,2324-2342,2553,2566-2579,2609,2703-2720,2788-2795
+python/sglang/srt/managers/schedule_batch.py.orig
+  s_db41684c0cb7d5::t_1d42c46a88221c 1-2997
+python/sglang/srt/managers/scheduler.py
+  s_db41684c0cb7d5::t_cae6e567432cc1 2276-2294,3851-3853
+python/sglang/srt/managers/scheduler.py.orig
+  s_db41684c0cb7d5::t_d9e5dc6ba50eb0 1-4266
+python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+  s_db41684c0cb7d5::t_3b9a400b91e2d5 150-155
+python/sglang/srt/managers/tokenizer_manager.py
+  s_db41684c0cb7d5::t_73b81f7ef4c185 546-551,553-557,1846-1847,2302
+python/sglang/srt/managers/tokenizer_manager.py.orig
+  s_db41684c0cb7d5::t_070583f2205d65 1-3117
+python/sglang/srt/mem_cache/allocator/base.py
+  s_db41684c0cb7d5::t_f09a9e3e31d658 50-53
+python/sglang/srt/mem_cache/allocator/paged.py
+  s_db41684c0cb7d5::t_3ed8f466ccf573 237
+python/sglang/srt/mem_cache/hicache_storage.py
+  s_db41684c0cb7d5::t_8a9f5b56d6c0df 8,91-111,145,160-184
+python/sglang/srt/mem_cache/hiradix_cache.py
+  s_db41684c0cb7d5::t_c4ee2543fdeaf2 1386-1394
+python/sglang/srt/mem_cache/kv_integrity.py
+  s_db41684c0cb7d5::t_653ad5d86b939e 1-281
+python/sglang/srt/mem_cache/memory_pool.py
+  s_db41684c0cb7d5::t_5509c81fa8038a 257-260,296
+python/sglang/srt/mem_cache/memory_pool.py.orig
+  s_db41684c0cb7d5::t_438011067ca591 1-2745
+python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py
+  s_db41684c0cb7d5::t_16d6437e46531f 22,803-807
+python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+  s_db41684c0cb7d5::t_ec723680f339d8 4,953-990
+python/sglang/srt/models/gemma4_mm.py
+  s_db41684c0cb7d5::t_dc7a13502082df 72-78,403-408
+python/sglang/srt/models/gemma4_vision.py
+  s_db41684c0cb7d5::t_dc58c20c15c55b 463-479,490-492
+python/sglang/srt/multimodal/processors/base_processor.py
+  s_db41684c0cb7d5::t_89e38668e3bf44 13,48-51,549-563,570-572,577-579,941-947,1086,1089-1090,1210
+python/sglang/srt/multimodal/processors/gemma4.py
+  s_db41684c0cb7d5::t_76b77b3cf56d4d 24-27,30-35,39-52,103-285,356-357
+python/sglang/srt/observability/req_time_stats.py
+  s_db41684c0cb7d5::t_371832ec68de99 979,985,987,995-997
+python/sglang/srt/observability/req_time_stats.py.orig
+  s_db41684c0cb7d5::t_d4ad23c0d9fa9f 1-1235
+python/sglang/srt/speculative/eagle_info_v2.py
+  s_db41684c0cb7d5::t_5f9d99cced1069 104-115
+python/sglang/srt/speculative/eagle_info_v2.py.orig
+  s_db41684c0cb7d5::t_b6bbd709faa6c6 1-111
+python/sglang/srt/speculative/eagle_utils.py
+  s_db41684c0cb7d5::t_1389d5bd0eb3d9 318-330
+python/sglang/srt/speculative/eagle_utils.py.orig
+  s_db41684c0cb7d5::t_52991e0e578003 1-563
+python/sglang/srt/speculative/ngram_worker.py
+  s_db41684c0cb7d5::t_79af8d12a53ea4 334-346
+python/sglang/srt/speculative/ngram_worker.py.orig
+  s_db41684c0cb7d5::t_8d30eb2f30975e 1-521
+python/sglang/srt/utils/common.py
+  s_db41684c0cb7d5::t_47b61330766b1f 92,922-924,3360-3371,3374-3413,3422-3425
+python/sglang/srt/utils/common.py.orig
+  s_db41684c0cb7d5::t_2b1a1b38cbd0af 1-4233
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "41c28e6ed51fb18c386f060db3cd30165ade3730",
+  "prompts": {},
+  "sessions": {
+    "s_db41684c0cb7d5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0a1d6-08a1-75f2-a1ee-285d1bf27153",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    }
+  }
+}
