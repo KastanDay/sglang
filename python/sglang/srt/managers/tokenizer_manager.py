@@ -134,6 +134,18 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
+
+def _drain_env_seconds(name: str) -> float:
+    """Read a non-negative seconds value from the environment; 0 disables."""
+    raw = os.environ.get(name, "")
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logging.getLogger(__name__).warning("Ignoring invalid %s=%r", name, raw)
+        return 0.0
+
 logger = logging.getLogger(__name__)
 
 _INCREMENTAL_STREAMING_META_INFO_KEYS = (
@@ -159,6 +171,11 @@ class ReqState:
 
     # For streaming output
     last_output_offset: int = 0
+
+    # Set once the tokenized request has been handed to the scheduler. States
+    # that were never dispatched have no scheduler-side owner to clean them up.
+    dispatched: bool = False
+    created_monotonic: float = dataclasses.field(default_factory=time.monotonic)
 
     # Accumulate text lazily so incremental streaming can emit the incoming
     # delta directly without rebuilding the full output prefix.
@@ -641,6 +658,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # are still pending; entries already removed on the normal completion
             # path are left untouched (pop is a no-op).
             self._discard_pending_req_states(obj)
+            raise
+        except BaseException:
+            # CancelledError / GeneratorExit (for example a client disconnect
+            # while the request is still tokenizing, loading multimodal inputs,
+            # or waiting on the pause/model-update locks) bypass the handler
+            # above. A state that never reached the scheduler has no remover:
+            # the disconnect abort task finds nothing scheduler-side, so no
+            # abort echo ever arrives, and the SIGTERM drain waits on it
+            # forever. Drop only undispatched states; dispatched ones are still
+            # cleaned up by the scheduler's abort echo.
+            self._discard_undispatched_req_states(obj)
             raise
 
     def _detect_input_format(
@@ -1332,6 +1360,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         tokenized_obj.time_stats.set_api_server_dispatch_time()
         tokenized_obj = wrap_shm_features(tokenized_obj)
         self.send_to_scheduler.send_pyobj(tokenized_obj)
+        self._mark_req_dispatched(tokenized_obj.rid)
         tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
 
     def _send_batch_request(
@@ -1348,6 +1377,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         set_time_batch(tokenized_objs, "set_api_server_dispatch_time")
         self.send_to_scheduler.send_pyobj(batch_req)
+        for tokenized_obj in tokenized_objs:
+            self._mark_req_dispatched(tokenized_obj.rid)
         set_time_batch(tokenized_objs, "set_api_server_dispatch_finish_time")
 
     def _coalesce_streaming_chunks(
@@ -2621,8 +2652,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
     async def sigterm_watchdog(self):
+        stale_log_age = _drain_env_seconds("SGLANG_STALE_REQ_LOG_AGE_SECS")
+        next_stale_scan = time.monotonic() + 60
         while not self.gracefully_exit:
             await asyncio.sleep(5)
+            if stale_log_age > 0 and time.monotonic() >= next_stale_scan:
+                next_stale_scan = time.monotonic() + 60
+                self._log_stale_req_states(stale_log_age)
+
+        # Bound the drain. Without these guards the loop below waits for
+        # rid_to_state to empty, so one leaked entry pins the pod until the
+        # kubelet SIGKILLs it at terminationGracePeriodSeconds.
+        drain_deadline = _drain_env_seconds("SGLANG_DRAIN_DEADLINE_SECS")
+        idle_grace = _drain_env_seconds("SGLANG_DRAIN_SCHEDULER_IDLE_GRACE_SECS")
+        drain_start = time.monotonic()
+        scheduler_idle_since = None
+        if drain_deadline > 0 or idle_grace > 0:
+            logger.info(
+                "Drain guards enabled: deadline=%.0fs scheduler_idle_grace=%.0fs",
+                drain_deadline,
+                idle_grace,
+            )
 
         # Drain requests
         while True:
@@ -2649,10 +2699,47 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             logger.info(
                 f"Gracefully exiting... Remaining number of requests {remain_num_req}. Remaining requests {remaining_rids=}."
             )
-            if remain_num_req > 0:
-                await asyncio.sleep(5)
-            else:
+            if remain_num_req == 0:
                 break
+
+            now = time.monotonic()
+            if drain_deadline > 0 and now - drain_start >= drain_deadline:
+                logger.error(
+                    "Drain deadline of %.0fs reached with %d remaining request(s); "
+                    "aborting them and exiting. %s",
+                    drain_deadline,
+                    remain_num_req,
+                    self._format_req_states(),
+                )
+                # Let live clients receive an abort finish instead of a reset.
+                self.abort_request(abort_all=True)
+                abort_wait_end = time.monotonic() + 5
+                while self.rid_to_state and time.monotonic() < abort_wait_end:
+                    await asyncio.sleep(0.5)
+                break
+
+            if idle_grace > 0:
+                if self._scheduler_is_idle():
+                    if scheduler_idle_since is None:
+                        scheduler_idle_since = now
+                    all_entries_old = all(
+                        now - state.created_monotonic >= idle_grace
+                        for state in list(self.rid_to_state.values())
+                    )
+                    if now - scheduler_idle_since >= idle_grace and all_entries_old:
+                        logger.error(
+                            "Schedulers idle for %.0fs but %d request state(s) remain "
+                            "in the tokenizer; treating them as orphaned and "
+                            "exiting. %s",
+                            now - scheduler_idle_since,
+                            remain_num_req,
+                            self._format_req_states(),
+                        )
+                        break
+                else:
+                    scheduler_idle_since = None
+
+            await asyncio.sleep(5)
 
         # Stop the watchdog: child exits are expected during shutdown, not crashes.
         if self._subprocess_watchdog is not None:
@@ -2883,6 +2970,110 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             rids = obj.rid
         for rid in rids:
             self.rid_to_state.pop(rid, None)
+
+    def _mark_req_dispatched(self, rid) -> None:
+        state = self.rid_to_state.get(rid)
+        if state is not None:
+            state.dispatched = True
+
+    def _discard_undispatched_req_states(self, obj) -> None:
+        """Drop states for *obj* that were never handed to the scheduler."""
+        if not hasattr(obj, "is_single") or obj.is_single:
+            rids = [obj.rid]
+        else:
+            rids = obj.rid or []
+        discarded = []
+        for rid in rids:
+            state = self.rid_to_state.get(rid)
+            if state is not None and not state.dispatched:
+                del self.rid_to_state[rid]
+                discarded.append(rid)
+        if discarded:
+            logger.warning(
+                "Discarded %d undispatched request state(s) after cancellation: %s",
+                len(discarded),
+                discarded,
+            )
+
+    def _format_req_states(self, states=None, limit: int = 20) -> str:
+        """One-line diagnostic summary of rid_to_state entries, oldest first."""
+        now = time.monotonic()
+        if states is None:
+            states = list(self.rid_to_state.items())
+        states = sorted(states, key=lambda item: item[1].created_monotonic)
+        parts = []
+        for rid, state in states[:limit]:
+            parts.append(
+                f"rid={rid} age={now - state.created_monotonic:.1f}s"
+                f" dispatched={state.dispatched}"
+                f" stream={getattr(state.obj, 'stream', False)}"
+                f" finished={state.finished}"
+                f" first_token={bool(state.time_stats.first_token_time)}"
+                f" output_tokens={len(state.output_ids)}"
+                f" pending_outputs={len(state.out_list)}"
+            )
+        if len(states) > limit:
+            parts.append(f"... and {len(states) - limit} more")
+        return "; ".join(parts)
+
+    def _read_scheduler_loads(self):
+        reader = getattr(self, "load_snapshot_reader", None)
+        if reader is None:
+            return None
+        try:
+            return reader.read_all()
+        except Exception as e:
+            logger.warning("Failed to read scheduler load snapshots: %s", e)
+            return None
+
+    def _scheduler_is_idle(self, max_snapshot_age: float = 10.0) -> bool:
+        """True only if every scheduler recently published an all-empty load."""
+        loads = self._read_scheduler_loads()
+        if not loads or len(loads) < max(1, self.server_args.dp_size):
+            return False
+        now = time.time()
+        for load in loads:
+            if now - load.timestamp > max_snapshot_age:
+                return False
+            busy = (
+                load.num_running_reqs
+                + load.num_waiting_reqs
+                + load.prefill_bootstrap_queue_reqs
+                + load.prefill_inflight_queue_reqs
+                + load.decode_prealloc_queue_reqs
+                + load.decode_transfer_queue_reqs
+                + load.decode_retracted_queue_reqs
+                + load.queue_waiting
+                + load.queue_grammar
+                + load.queue_paused
+                + load.queue_retracted
+            )
+            if busy:
+                return False
+        return True
+
+    def _log_stale_req_states(self, min_age: float) -> None:
+        now = time.monotonic()
+        stale = [
+            (rid, state)
+            for rid, state in list(self.rid_to_state.items())
+            if now - state.created_monotonic >= min_age
+        ]
+        if not stale:
+            return
+        loads = self._read_scheduler_loads() or []
+        scheduler_reqs = sum(
+            load.num_running_reqs + load.num_waiting_reqs for load in loads
+        )
+        logger.warning(
+            "Possible leaked request states: %d of %d tokenizer entries are older "
+            "than %.0fs (scheduler running+waiting=%d). %s",
+            len(stale),
+            len(self.rid_to_state),
+            min_age,
+            scheduler_reqs,
+            self._format_req_states(stale),
+        )
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
