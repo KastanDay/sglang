@@ -1,0 +1,19 @@
+python/sglang/srt/managers/tokenizer_manager.py
+  s_829f9ceabcf3a4::t_b89a43fdca1dbf 137-148,175-179,662-672,1363,1380-1381,2655-2656,2659-2675,2702-2718,2721-2743,2974-3077
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "752a34daa336b927af51c2e6d55f662e9c9c48c5",
+  "prompts": {},
+  "sessions": {
+    "s_829f9ceabcf3a4": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f25165b02ffeTCr4rBEr86JT8h",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    }
+  }
+}
