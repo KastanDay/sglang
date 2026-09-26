@@ -1,0 +1,117 @@
+python/sglang/srt/constrained/base_grammar_backend.py
+  s_829f9ceabcf3a4::t_4bb36c453873ab 311-313
+python/sglang/srt/constrained/reasoner_grammar_backend.py
+  s_829f9ceabcf3a4::t_76c8e932283199 56,68,117,135-142,144-146,161-177,201-210,254,273,278-282,284,324
+python/sglang/srt/constrained/reasoner_grammar_backend.py.orig
+  s_829f9ceabcf3a4::t_a8c578db845403 1-320
+python/sglang/srt/disaggregation/common/conn.py
+  s_829f9ceabcf3a4::t_e1056fde10ff08 1033-1038,1096-1102,1109,1111-1115,1134-1140
+python/sglang/srt/disaggregation/decode.py
+  s_829f9ceabcf3a4::t_10507ecff70081 717-719,831-838,1088-1092,1425-1428,1814-1826,1845
+python/sglang/srt/disaggregation/decode.py.orig
+  s_829f9ceabcf3a4::t_6a89ce6e07264c 1-1989
+python/sglang/srt/disaggregation/decode_schedule_batch_mixin.py
+  s_829f9ceabcf3a4::t_b119cb5bf03b14 132-134
+python/sglang/srt/disaggregation/mooncake/conn.py
+  s_829f9ceabcf3a4::t_82cd3757fa382c 15-16,66-122,1234-1236,1449-1472,1474-1498,1507-1513,1885,1920-1923,1939-1940,1942-1952,1981-1984,1999-2007,2009-2011
+python/sglang/srt/disaggregation/mooncake/conn.py.orig
+  s_829f9ceabcf3a4::t_27c99e2b563505 1-1905
+python/sglang/srt/disaggregation/mori/conn.py
+  s_829f9ceabcf3a4::t_629df9019a176c 1627,1629,1647-1672,1674-1677,1708-1729,1731-1733
+python/sglang/srt/disaggregation/nixl/conn.py
+  s_829f9ceabcf3a4::t_63f8ea24186876 15,2037-2058,2060-2062,2098,2132-2162,2164-2167
+python/sglang/srt/disaggregation/prefill.py
+  s_829f9ceabcf3a4::t_96e325e9554f6b 764-765,786-791
+python/sglang/srt/environ.py
+  s_829f9ceabcf3a4::t_e685ba0df507ff 305
+python/sglang/srt/function_call/gemma4_detector.py
+  s_829f9ceabcf3a4::t_8fbaaedf6c8349 91-95,108-109
+python/sglang/srt/function_call/kimik2_detector.py
+  s_829f9ceabcf3a4::t_9b12f59ee99c96 179-184,187,197,202,214,217-226,231,233,235-256,258-260,262-277,279-307,309,312,314-330,332-334,337-341,343-346,348-350,354-414
+python/sglang/srt/managers/detokenizer_manager.py
+  s_829f9ceabcf3a4::t_e91b78aa371448 20,149-167,184,188-192
+python/sglang/srt/managers/multi_tokenizer_mixin.py
+  s_829f9ceabcf3a4::t_922c11cb39c160 336,339,341-355
+python/sglang/srt/managers/multi_tokenizer_mixin.py.orig
+  s_829f9ceabcf3a4::t_7bc71bed6e0a09 1-747
+python/sglang/srt/managers/schedule_batch.py
+  s_829f9ceabcf3a4::t_7548ca9371bbe5 257,301-303,315,322-331,681-709,1659,1663,1665-1674,1682,2324-2342,2553,2566-2579,2609,2703-2720,2788-2795
+python/sglang/srt/managers/schedule_batch.py.orig
+  s_829f9ceabcf3a4::t_351043dbb8ee9e 1-2997
+python/sglang/srt/managers/scheduler.py
+  s_829f9ceabcf3a4::t_46b3576c39beb2 2276-2294,3851-3853
+python/sglang/srt/managers/scheduler.py.orig
+  s_829f9ceabcf3a4::t_899e9ad686bc1a 1-4266
+python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+  s_829f9ceabcf3a4::t_cac9fb2d90089e 150-155
+python/sglang/srt/managers/tokenizer_manager.py
+  s_829f9ceabcf3a4::t_4526b3c359c4a5 546-551,553-557,1846-1847,2302
+python/sglang/srt/managers/tokenizer_manager.py.orig
+  s_829f9ceabcf3a4::t_c1ca54d699cfe3 1-3117
+python/sglang/srt/mem_cache/allocator/base.py
+  s_829f9ceabcf3a4::t_075d465242f978 50-53
+python/sglang/srt/mem_cache/allocator/paged.py
+  s_829f9ceabcf3a4::t_396f1a09d5da06 237
+python/sglang/srt/mem_cache/hicache_storage.py
+  s_829f9ceabcf3a4::t_2386b666d45f94 8,91-111,145,160-184
+python/sglang/srt/mem_cache/hiradix_cache.py
+  s_829f9ceabcf3a4::t_0bfb5328648d20 1386-1394
+python/sglang/srt/mem_cache/kv_integrity.py
+  s_829f9ceabcf3a4::t_50463cb3743d43 1-281
+python/sglang/srt/mem_cache/memory_pool.py
+  s_829f9ceabcf3a4::t_bfb91f3dd7d89c 257-260,296
+python/sglang/srt/mem_cache/memory_pool.py.orig
+  s_829f9ceabcf3a4::t_372e3a30702f62 1-2745
+python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py
+  s_829f9ceabcf3a4::t_180e8b5c44853b 22,803-807
+python/sglang/srt/mem_cache/unified_radix_cache.py
+  s_829f9ceabcf3a4::t_37de325de3329f 1985,1989-1991,1993,2005-2009,2015-2017,2096-2100
+python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
+  s_829f9ceabcf3a4::t_401424b97ad428 4,953-990
+python/sglang/srt/models/gemma4_mm.py
+  s_829f9ceabcf3a4::t_1eb2ba0f97ee28 72-78,403-408
+python/sglang/srt/models/gemma4_vision.py
+  s_829f9ceabcf3a4::t_7c1193dd63e022 463-479,490-492
+python/sglang/srt/multimodal/processors/base_processor.py
+  s_829f9ceabcf3a4::t_269fdb15394fa4 13,48-51,549-563,570-572,577-579,941-947,1086,1089-1090,1210
+python/sglang/srt/multimodal/processors/gemma4.py
+  s_829f9ceabcf3a4::t_0c551763bcdf23 24-27,30-35,39-52,103-285,356-357
+python/sglang/srt/observability/metrics_collector.py
+  s_829f9ceabcf3a4::t_727c3df78c8538 1749-1757,1814-1816
+python/sglang/srt/observability/req_time_stats.py
+  s_829f9ceabcf3a4::t_31604f031a781f 979,985,987,995-997
+python/sglang/srt/observability/req_time_stats.py.orig
+  s_829f9ceabcf3a4::t_18edd8f49cb4e5 1-1235
+python/sglang/srt/speculative/eagle_info_v2.py
+  s_829f9ceabcf3a4::t_cb6e56ad44cc58 104-115
+python/sglang/srt/speculative/eagle_info_v2.py.orig
+  s_829f9ceabcf3a4::t_d07148216502f6 1-111
+python/sglang/srt/speculative/eagle_utils.py
+  s_829f9ceabcf3a4::t_cd36c47b168ecd 318-330
+python/sglang/srt/speculative/eagle_utils.py.orig
+  s_829f9ceabcf3a4::t_551c19ee2b2354 1-563
+python/sglang/srt/speculative/ngram_worker.py
+  s_829f9ceabcf3a4::t_292a2f2af16875 334-346
+python/sglang/srt/speculative/ngram_worker.py.orig
+  s_829f9ceabcf3a4::t_cd93acb48aada6 1-521
+python/sglang/srt/utils/common.py
+  s_829f9ceabcf3a4::t_0d0a00d6998565 92,922-924,3360-3371,3374-3413,3422-3425
+python/sglang/srt/utils/common.py.orig
+  s_829f9ceabcf3a4::t_0dd220092c756e 1-4233
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f5591681eee43e2b295ab5058b533c94a7814db5",
+  "prompts": {},
+  "sessions": {
+    "s_829f9ceabcf3a4": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f25165b02ffeTCr4rBEr86JT8h",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    }
+  }
+}
