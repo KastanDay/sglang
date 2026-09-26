@@ -12,8 +12,7 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
-import zmq
-from prometheus_client import Counter, Gauge, Histogram
+from prometheus_client import Counter
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
@@ -62,63 +61,6 @@ FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
 )
-
-DISAGG_ZMQ_LOCK_WAIT_SECONDS = Histogram(
-    "sglang:disagg_zmq_lock_wait_seconds",
-    "Time waiting for a shared decode-to-prefill ZMQ socket lock.",
-    labelnames=["operation"],
-    buckets=(0.0001, 0.001, 0.01, 0.1, 0.5, 1.0, 5.0),
-)
-DISAGG_ZMQ_SEND_SECONDS = Histogram(
-    "sglang:disagg_zmq_send_seconds",
-    "Time spent sending decode-to-prefill ZMQ messages.",
-    labelnames=["operation", "outcome"],
-    buckets=(0.0001, 0.001, 0.01, 0.1, 0.5, 1.0, 5.0),
-)
-MOONCAKE_BOOTSTRAP_MESSAGES = Counter(
-    "sglang:mooncake_bootstrap_messages_total",
-    "Messages consumed by the prefill Mooncake bootstrap thread.",
-    labelnames=["kind"],
-)
-MOONCAKE_BOOTSTRAP_LAST_RECEIVE_TIMESTAMP_SECONDS = Gauge(
-    "sglang:mooncake_bootstrap_last_receive_timestamp_seconds",
-    "Unix timestamp of the last message consumed by the prefill bootstrap thread.",
-    multiprocess_mode="mostrecent",
-)
-MOONCAKE_TRANSFER_WORKER_LAST_PROGRESS_TIMESTAMP_SECONDS = Gauge(
-    "sglang:mooncake_transfer_worker_last_progress_timestamp_seconds",
-    "Unix timestamp when a prefill transfer worker last handled a queue item.",
-    labelnames=["worker"],
-    multiprocess_mode="mostrecent",
-)
-
-
-def _send_multipart_with_metrics(sock, lock, parts, operation: str):
-    lock_start = time.perf_counter()
-    with lock:
-        try:
-            DISAGG_ZMQ_LOCK_WAIT_SECONDS.labels(operation=operation).observe(
-                time.perf_counter() - lock_start
-            )
-        except Exception:
-            pass
-        send_start = time.perf_counter()
-        try:
-            sock.send_multipart(parts)
-        except Exception:
-            try:
-                DISAGG_ZMQ_SEND_SECONDS.labels(
-                    operation=operation, outcome="error"
-                ).observe(time.perf_counter() - send_start)
-            except Exception:
-                pass
-            raise
-        try:
-            DISAGG_ZMQ_SEND_SECONDS.labels(
-                operation=operation, outcome="success"
-            ).observe(time.perf_counter() - send_start)
-        except Exception:
-            pass
 
 
 # decode
@@ -1231,9 +1173,6 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
-                MOONCAKE_TRANSFER_WORKER_LAST_PROGRESS_TIMESTAMP_SECONDS.labels(
-                    worker=str(worker_index)
-                ).set(time.time())
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -1446,56 +1385,10 @@ class MooncakeKVManager(CommonKVManager):
                     self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
 
             except Exception as e:
-                MOONCAKE_TRANSFER_WORKER_LAST_PROGRESS_TIMESTAMP_SECONDS.labels(
-                    worker=str(worker_index)
-                ).set(time.time())
-                # Upstream originally re-raised this as RuntimeError, killing the
-                # daemon transfer_worker thread while leaving the main Python
-                # process (and its HTTP /health endpoint) running. Kubernetes
-                # would not restart the pod, but every subsequent KV transfer
-                # routed to it would hang until the decode side hit the 90s
-                # SGLANG_DISAGGREGATION_WAITING_TIMEOUT and returned 500.
-                #
-                # Instead: log the full traceback, fail the in-flight request
-                # the same way the `ret != 0` path does (so the decode gets a
-                # KVPoll.Failed notification in <1s), and continue the loop so
-                # the thread stays alive for other requests.
-                #
-                # NOTE: we deliberately do NOT blacklist the mooncake_session_id
-                # here — this exception indicates a prefill-side bug, not a
-                # dead peer, and blacklisting would poison the session for
-                # every future request to that decode.
-                logger.exception(
-                    "Transfer thread caught unexpected exception for room=%s on "
-                    "bootstrap_port=%s; failing this request and continuing.",
-                    getattr(kv_chunk, "room", "<unknown>"),
-                    self.bootstrap_port,
+                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
+                raise RuntimeError(
+                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
-                try:
-                    room = getattr(kv_chunk, "room", None)
-                    if room is not None and room in self.transfer_infos:
-                        self.record_failure(
-                            room,
-                            f"Prefill transfer thread raised unexpected exception: {e}",
-                        )
-                        self.update_status(room, KVPoll.Failed)
-                        for failed_req in self.transfer_infos[room].values():
-                            if failed_req.is_dummy:
-                                continue
-                            self.sync_status_to_decode_endpoint(
-                                failed_req.endpoint,
-                                failed_req.dst_port,
-                                failed_req.room,
-                                KVPoll.Failed,
-                                prefill_unique_rank,
-                            )
-                        self.transfer_infos.pop(room, None)
-                except Exception:
-                    logger.exception(
-                        "Secondary failure while reporting KVPoll.Failed for room=%s",
-                        getattr(kv_chunk, "room", "<unknown>"),
-                    )
-                continue
 
     def start_prefill_thread(self):
         def bootstrap_thread():
@@ -1504,13 +1397,6 @@ class MooncakeKVManager(CommonKVManager):
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
                 room = waiting_req_bytes[0].decode("ascii")
-                message_kind = (
-                    room.lower()
-                    if room in {"ABORT", "STAGING_RSP", "WATERMARK"}
-                    else "register" if room == "None" else "metadata"
-                )
-                MOONCAKE_BOOTSTRAP_MESSAGES.labels(kind=message_kind).inc()
-                MOONCAKE_BOOTSTRAP_LAST_RECEIVE_TIMESTAMP_SECONDS.set(time.time())
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
                     from sglang.srt.disaggregation.common.staging_handler import (
@@ -1882,7 +1768,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         self.init_time = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
 
-    def _register_kv_args(self) -> bool:
+    def _register_kv_args(self):
         for bootstrap_info in self.bootstrap_infos:
             packed_kv_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
@@ -1917,10 +1803,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 staging_total_size_str = b""
 
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-            try:
-                _send_multipart_with_metrics(
-                    sock,
-                    lock,
+            with lock:
+                sock.send_multipart(
                     [
                         "None".encode("ascii"),
                         self.kv_mgr.local_ip.encode("ascii"),
@@ -1936,20 +1820,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         packed_state_dim_per_tensor,
                         packed_staging_base_ptr,
                         staging_total_size_str,
-                    ],
-                    "register_kv_args",
+                    ]
                 )
-            except zmq.ZMQError as e:
-                if not isinstance(e, zmq.Again):
-                    self._disconnect_bootstrap_server(bootstrap_info, sock)
-                self.kv_mgr.record_failure(
-                    self.bootstrap_room,
-                    f"_register_kv_args to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
-                )
-                self.conclude_state = KVPoll.Failed
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-                return False
-        return True
 
     def send_metadata(
         self,
@@ -1978,10 +1850,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
-            try:
-                _send_multipart_with_metrics(
-                    sock,
-                    lock,
+
+            with lock:
+                sock.send_multipart(
                     [
                         str(self.bootstrap_room).encode("ascii"),
                         self.kv_mgr.local_ip.encode("ascii"),
@@ -1996,19 +1867,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
                         str(decode_prefix_len or 0).encode("ascii"),
-                    ],
-                    "send_metadata",
+                    ]
                 )
-            except zmq.ZMQError as e:
-                if not isinstance(e, zmq.Again):
-                    self._disconnect_bootstrap_server(bootstrap_info, sock)
-                self.kv_mgr.record_failure(
-                    self.bootstrap_room,
-                    f"send_metadata to prefill {bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')} failed",
-                )
-                self.conclude_state = KVPoll.Failed
-                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-                return
         self.init_time = time.time()
 
     def poll(self) -> KVPoll:

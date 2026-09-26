@@ -53,7 +53,6 @@ class ReasonerGrammarObject(BaseGrammarObject):
         grammar: Optional[BaseGrammarObject],
         think_end_id: int,
         think_excluded_token_ids: Optional[List[int]] = None,
-        model_eos_token_ids: Optional[List[int]] = None,
         max_think_tokens: int = -1,
         enable_token_filter: bool = False,
         token_filter_fn=None,
@@ -65,7 +64,6 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self.grammar = grammar
         self.think_end_id = think_end_id
         self.think_excluded_token_ids = think_excluded_token_ids
-        self.model_eos_token_ids = model_eos_token_ids
         self.max_think_tokens = max_think_tokens
         self.enable_token_filter = enable_token_filter
         self.token_filter_fn = token_filter_fn
@@ -132,18 +130,9 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def _can_think_more(self):
         return self.max_think_tokens < 0 or self.tokens_in_think < self.max_think_tokens
 
-    def _do_token_filter(
-        self,
-        vocab_mask,
-        token_ids,
-        idx,
-        is_allowed=True,
-        reset_vocab_mask=True,
-    ):
+    def _do_token_filter(self, vocab_mask, token_ids, idx, is_allowed=True):
         if self.token_filter_fn is not None:
-            self.token_filter_fn(
-                vocab_mask, token_ids, idx, is_allowed, reset_vocab_mask
-            )
+            self.token_filter_fn(vocab_mask, token_ids, idx, is_allowed)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         if self._is_thinking():
@@ -158,23 +147,8 @@ class ReasonerGrammarObject(BaseGrammarObject):
                     vocab_mask, self._think_end_id_list, idx, is_allowed=True
                 )
             return
-        if self._is_generation():
-            if self.grammar is not None:
-                self.grammar.fill_vocab_mask(vocab_mask, idx)
-            # Prevent a successful response with reasoning but no answer/tool call.
-            if (
-                self.enable_token_filter
-                and self.tokens_in_think >= 0
-                and self.tokens_after_end == 0
-                and self.model_eos_token_ids
-            ):
-                self._do_token_filter(
-                    vocab_mask,
-                    self.model_eos_token_ids,
-                    idx,
-                    is_allowed=False,
-                    reset_vocab_mask=self.grammar is None,
-                )
+        if self._is_generation() and self.grammar is not None:
+            self.grammar.fill_vocab_mask(vocab_mask, idx)
 
     def allocate_vocab_mask(self, vocab_size, batch_size, device):
         if self.grammar is not None:
@@ -198,16 +172,15 @@ class ReasonerGrammarObject(BaseGrammarObject):
 
     def copy(self):
         new_obj = ReasonerGrammarObject(
-            grammar=self.grammar.copy() if self.grammar is not None else None,
-            think_end_id=self.think_end_id,
-            think_excluded_token_ids=self.think_excluded_token_ids,
-            model_eos_token_ids=self.model_eos_token_ids,
-            max_think_tokens=self.max_think_tokens,
-            enable_token_filter=self.enable_token_filter,
-            token_filter_fn=self.token_filter_fn,
-            allocate_vocab_mask_fn=self.allocate_vocab_mask_fn,
-            move_vocab_mask_fn=self.move_vocab_mask_fn,
-            apply_vocab_mask_fn=self.apply_vocab_mask_fn,
+            self.grammar.copy() if self.grammar is not None else None,
+            self.think_end_id,
+            self.think_excluded_token_ids,
+            self.max_think_tokens,
+            self.enable_token_filter,
+            self.token_filter_fn,
+            self.allocate_vocab_mask_fn,
+            self.move_vocab_mask_fn,
+            self.apply_vocab_mask_fn,
         )
         new_obj.tokens_in_think = self.tokens_in_think
         new_obj.tokens_after_end = self.tokens_after_end
@@ -251,7 +224,6 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         reasoning_parser: ReasoningParser,
         tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
         enable_strict_thinking: bool = False,
-        model_eos_token_ids: Optional[List[int]] = None,
     ):
         super().__init__()
         self.grammar_backend = grammar_backend
@@ -270,18 +242,13 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             )
         self.think_end_id = think_end_ids[0]
         self._enable_strict_thinking = enable_strict_thinking
-        self.model_eos_token_ids = model_eos_token_ids
         self.think_excluded_token_ids = self._get_think_excluded_token_ids(
             reasoning_parser, tokenizer
         )
         self.max_think_tokens = envs.SGLANG_MAX_THINK_TOKENS.get()
-        self.enable_token_filter = self.enable_strict_thinking and (
-            self.think_excluded_token_ids is not None
-            or self.model_eos_token_ids is not None
-            or self.max_think_tokens >= 0
-        )
         if (
-            self.enable_token_filter
+            self.enable_strict_thinking
+            and self.think_excluded_token_ids is not None
             and not self.grammar_backend.is_support_token_filter
         ):
             raise ValueError(
@@ -289,6 +256,11 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
                 "support token filtering. Use a grammar backend that supports token "
                 "filtering (e.g., xgrammar) or disable strict reasoning mode."
             )
+        self.enable_token_filter = (
+            self.enable_strict_thinking
+            and self.think_excluded_token_ids is not None
+            and self.grammar_backend.is_support_token_filter
+        )
         self._token_filter_fn = (
             self.grammar_backend.set_token_filter if self.enable_token_filter else None
         )
@@ -321,7 +293,6 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
             grammar=grammar,
             think_end_id=self.think_end_id,
             think_excluded_token_ids=self.think_excluded_token_ids,
-            model_eos_token_ids=self.model_eos_token_ids,
             max_think_tokens=self.max_think_tokens,
             enable_token_filter=self.enable_token_filter,
             token_filter_fn=self._token_filter_fn,

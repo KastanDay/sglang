@@ -1746,6 +1746,15 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.storage_prefetch_timeout_fallbacks_total = Counter(
+            name="sglang:storage_prefetch_timeout_fallbacks_total",
+            documentation="Number of L3 storage prefetches that reached the "
+            "HiCache timeout before the requested prefix was fully fetched, "
+            "forcing the remaining prefix to be recomputed.",
+            labelnames=labels.keys(),
+        )
+        self.storage_prefetch_timeout_fallbacks_total.labels(**self.labels)
+
         self.backuped_tokens_total = Counter(
             name="sglang:backuped_tokens_total",
             documentation="Number of backuped tokens.",
@@ -1801,6 +1810,9 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
+
+    def log_storage_prefetch_timeout_fallback(self):
+        self.storage_prefetch_timeout_fallbacks_total.labels(**self.labels).inc()
 
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:

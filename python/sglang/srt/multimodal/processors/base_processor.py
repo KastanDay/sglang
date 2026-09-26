@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from transformers import BaseImageProcessor
 
 from sglang.srt.managers.schedule_batch import (
@@ -43,6 +43,10 @@ _is_xpu = is_xpu()
 
 SGL_USE_CUDA_IPC = envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get()
 _IPC_POOL_HANDLE_CACHE = envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
+
+
+class InvalidMultimodalDataError(ValueError):
+    pass
 
 
 @dataclasses.dataclass
@@ -542,20 +546,37 @@ class BaseMultimodalProcessor(ABC):
                     and not isinstance(img, torch.Tensor)
                     and img.mode != "RGB"
                 ):
-                    # Needed only when `img` is a PIL image
-                    img = img.convert("RGB")
+                    try:
+                        # Needed only when `img` is a PIL image
+                        img = img.convert("RGB")
+                    except (OSError, SyntaxError) as e:
+                        raise InvalidMultimodalDataError(
+                            f"Error while decoding image data: {e}"
+                        ) from e
+                elif not isinstance(img, torch.Tensor):
+                    try:
+                        # Pillow decodes lazily; validate before preprocessing.
+                        img.load()
+                    except (OSError, SyntaxError) as e:
+                        raise InvalidMultimodalDataError(
+                            f"Error while decoding image data: {e}"
+                        ) from e
                 return img
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
-        except ValueError as e:
+        except InvalidMultimodalDataError:
+            raise
+        except (UnidentifiedImageError, ValueError) as e:
             # Bad input (e.g. invalid base64) -> 400, not 500.
             data_str = str(data)
             if len(data_str) > 100:
                 data_str = data_str[:100] + "..."
-            raise ValueError(f"Error while loading data {data_str}: {e}") from e
+            raise InvalidMultimodalDataError(
+                f"Error while loading data {data_str}: {e}"
+            ) from e
         except Exception as e:
             data_str = str(data)
             if len(data_str) > 100:
@@ -917,6 +938,13 @@ class BaseMultimodalProcessor(ABC):
         for modality, idx, future in futures:
             try:
                 result = await asyncio.wrap_future(future)
+            except InvalidMultimodalDataError:
+                logger.exception(
+                    "[load_mm_data(simple)] error loading %s data at index=%d",
+                    modality.name,
+                    idx,
+                )
+                raise
             except Exception as e:
                 logger.exception(
                     "[load_mm_data(simple)] error loading %s data at index=%d",
@@ -1055,9 +1083,11 @@ class BaseMultimodalProcessor(ABC):
                 if has_precomputed_input:
                     new_text_parts += [text_part]
                     continue
-                raise RuntimeError(
+                raise InvalidMultimodalDataError(
                     f"An exception occurred while loading multimodal data: {e}"
                 )
+            except InvalidMultimodalDataError:
+                raise
             except Exception as e:
                 raise RuntimeError(
                     f"An exception occurred while loading multimodal data: {e}"
@@ -1177,6 +1207,7 @@ class BaseMultimodalProcessor(ABC):
                 if isinstance(hash_value, torch.Tensor):
                     hash_value = hash_value.item()
                 item.hash = int(hash_value)
+                item.has_external_cache_key = True
                 pad_value = get_data_value("pad_value")
                 if pad_value is not None:
                     if isinstance(pad_value, torch.Tensor):

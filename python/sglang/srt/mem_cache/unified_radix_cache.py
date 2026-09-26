@@ -1982,12 +1982,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 operation.completed_tokens == len(operation.hash_value) * self.page_size
             )
 
+        timed_out = False
         if self.prefetch_stop_policy == "wait_complete":
             can_terminate = completed
         elif self.prefetch_stop_policy == "timeout":
-            can_terminate = completed or self._prefetch_timeout_check_linear_func(
-                operation
+            timed_out = (
+                not completed
+                and self._prefetch_timeout_check_linear_func(operation)
             )
+            can_terminate = completed or timed_out
         else:
             return True
         if (
@@ -1999,12 +2002,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         operation_terminated = operation.is_terminated()
         states = torch.tensor(
-            [1 - int(can_terminate), int(operation_terminated)],
+            [
+                1 - int(can_terminate),
+                int(operation_terminated),
+                int(timed_out),
+            ],
             dtype=torch.int,
         )
         self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
         can_terminate = states[0].item() == 0
         operation_terminated = states[1].item() == 1
+        operation.prefetch_timed_out = (
+            can_terminate and not operation_terminated and states[2].item() == 1
+        )
         return can_terminate or operation_terminated
 
     def check_prefetch_progress(self, req_id: str) -> bool:
@@ -2083,6 +2093,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
+            if (
+                getattr(operation, "prefetch_timed_out", False)
+                and min_completed_tokens < len(prefetch_key)
+            ):
+                self.storage_metrics_collector.log_storage_prefetch_timeout_fallback()
         return True
 
     def terminate_prefetch(self, req_id: str) -> None:

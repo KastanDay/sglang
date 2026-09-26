@@ -460,6 +460,23 @@ class Gemma4VisionPatchEmbedder(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def get_gemma4_vision_pooling_indices(
+    patch_positions: torch.Tensor, input_seq_len: int, length: int
+) -> Tuple[torch.Tensor, int]:
+    k = int((input_seq_len // length) ** 0.5)
+    k_squared = k**2
+    if k_squared * length != input_seq_len:
+        raise ValueError(
+            f"Cannot pool sequence length {input_seq_len} to {length}: "
+            f"{k=}^2 times {length=} must be {input_seq_len}."
+        )
+    clamped_positions = patch_positions.clamp(min=0)
+    max_x = clamped_positions[..., 0].max(dim=-1, keepdim=True)[0] + 1
+    kernel_idxs = torch.div(clamped_positions, k, rounding_mode="floor")
+    kernel_idxs = kernel_idxs[..., 0] + (max_x // k) * kernel_idxs[..., 1]
+    return kernel_idxs, k_squared
+
+
 class Gemma4VisionPooler(nn.Module):
     def __init__(self, config: Gemma4VisionConfig):
         super().__init__()
@@ -470,17 +487,9 @@ class Gemma4VisionPooler(nn.Module):
         self, x: torch.Tensor, patch_positions: torch.Tensor, length: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         input_seq_len = x.shape[1]
-        k = int((input_seq_len // length) ** 0.5)
-        k_squared = k**2
-        if k_squared * length != input_seq_len:
-            raise ValueError(
-                f"Cannot pool {x.shape} to {length}: {k=}^2 times {length=} must be {input_seq_len}."
-            )
-        clamped_positions = patch_positions.clamp(min=0)
-        max_x = clamped_positions[..., 0].max(dim=-1, keepdim=True)[0] + 1
-        kernel_idxs = torch.div(clamped_positions, k, rounding_mode="floor")
-        kernel_idxs = kernel_idxs[..., 0] + (max_x // k) * kernel_idxs[..., 1]
-
+        kernel_idxs, k_squared = get_gemma4_vision_pooling_indices(
+            patch_positions, input_seq_len, length
+        )
         weights = F.one_hot(kernel_idxs.long(), length).float() / k_squared
         output = weights.transpose(1, 2).to(x.dtype) @ x
         mask = torch.logical_not((weights == 0).all(dim=1))

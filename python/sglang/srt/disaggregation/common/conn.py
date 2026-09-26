@@ -1029,10 +1029,13 @@ class CommonKVReceiver(BaseKVReceiver):
                             return
 
                 self.bootstrap_infos = bootstrap_infos
-                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
 
-                # Register kv_args only once to prefill KVManager according to the info fetched from the bootstrap server
-                self._register_kv_args()
+                # Register kv_args only once to prefill KVManager according to the info fetched
+                # from the bootstrap server. Do this before caching in connection_pool so a failed
+                # registration does not leave a stale entry that later requests would reuse.
+                if not self._register_kv_args():
+                    return
+                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
             else:
                 self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
 
@@ -1090,14 +1093,26 @@ class CommonKVReceiver(BaseKVReceiver):
                 sock = cls._ctx.socket(zmq.PUSH)
                 if is_ipv6:
                     sock.setsockopt(zmq.IPV6, 1)
+                sock.setsockopt(zmq.LINGER, 0)
+                sock.setsockopt(zmq.IMMEDIATE, 1)
+                # Bound send so a dead peer cannot block the scheduler forever.
+                sock.setsockopt(
+                    zmq.SNDTIMEO,
+                    envs.SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT.get() * 1000,
+                )
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
                 cls._socket_locks[endpoint] = threading.Lock()
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
 
     @classmethod
-    def disconnect_endpoint(cls, endpoint: str):
+    def disconnect_endpoint(cls, endpoint: str, expected_socket=None):
         with cls._global_lock:
+            if (
+                expected_socket is not None
+                and cls._socket_cache.get(endpoint) is not expected_socket
+            ):
+                return
             sock = cls._socket_cache.pop(endpoint, None)
             lock = cls._socket_locks.pop(endpoint, None)
         if sock:
@@ -1116,8 +1131,13 @@ class CommonKVReceiver(BaseKVReceiver):
         sock, lock = cls._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
         return sock, lock
 
-    def _register_kv_args(self):
-        pass
+    @classmethod
+    def _disconnect_bootstrap_server(cls, bootstrap_info: dict, expected_socket):
+        na = NetworkAddress(bootstrap_info["rank_ip"], bootstrap_info["rank_port"])
+        cls.disconnect_endpoint(na.to_tcp(), expected_socket)
+
+    def _register_kv_args(self) -> bool:
+        return True
 
     def send_metadata(
         self,

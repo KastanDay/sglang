@@ -17,6 +17,7 @@ import dataclasses
 import logging
 import os
 import signal
+import time
 from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -145,6 +146,25 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         if server_args.enable_metrics:
             start_cpu_monitor_thread("detokenizer")
+            from prometheus_client import Counter, Histogram
+            self._batches_total = Counter(
+                name="sglang:detokenizer_batches_total",
+                documentation="Number of detokenizer batches processed.",
+            )
+            self._batch_size = Histogram(
+                name="sglang:detokenizer_batch_size",
+                documentation="Number of requests per detokenizer batch.",
+                buckets=(1, 2, 4, 8, 16, 32, 64, 128),
+            )
+            self._decode_seconds = Histogram(
+                name="sglang:detokenizer_decode_seconds",
+                documentation="Wall time of one detokenizer batch_decode call.",
+                buckets=(0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5),
+            )
+        else:
+            self._batches_total = None
+            self._batch_size = None
+            self._decode_seconds = None
 
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
@@ -161,9 +181,15 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = self.recv_from_scheduler.recv_pyobj()
+            t0 = time.perf_counter()
             output = self._request_dispatcher(recv_obj)
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
+                if self._batches_total is not None:
+                    self._batches_total.inc()
+                    if hasattr(recv_obj, "rids"):
+                        self._batch_size.observe(len(recv_obj.rids))
+                    self._decode_seconds.observe(time.perf_counter() - t0)
             self.soft_watchdog.feed()
 
     def trim_matched_stop(

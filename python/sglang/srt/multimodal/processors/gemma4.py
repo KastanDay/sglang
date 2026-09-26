@@ -21,11 +21,33 @@ import torch
 from sglang.srt.managers.multimodal_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.models.gemma4_audio import _SSCP_CONV_STRIDE_SIZES
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.models.gemma4_vision import get_gemma4_vision_pooling_indices
+from sglang.srt.multimodal.processors.base_processor import (
+    InvalidMultimodalDataError,
+    MultimodalSpecialTokens,
+)
+from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+
+
+def _get_visual_cache_modifier(modality, features, position_tensors):
+    return {
+        "position_tensors": position_tensors,
+        "metadata": (
+            modality,
+            tuple((tuple(tensor.shape), str(tensor.dtype)) for tensor in features),
+            tuple(
+                (tuple(tensor.shape), str(tensor.dtype))
+                for tensor in position_tensors
+            ),
+        ),
+    }
 
 
 class Gemma4SGLangProcessor(SGLangBaseProcessor):
@@ -77,6 +99,189 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
         hop = getattr(fe, "hop_length", 160)
         first_stride = _SSCP_CONV_STRIDE_SIZES[0][0]
         return hop * first_stride
+
+    def _validate_visual_token_counts(self, mm_items) -> None:
+        for item_idx, item in enumerate(mm_items):
+            if item.is_image():
+                modality = "image"
+                position_attr = "image_position_ids"
+            elif item.is_video():
+                modality = "video"
+                position_attr = "video_position_ids"
+            else:
+                continue
+            if item.is_precomputed_embedding():
+                continue
+
+            position_values = getattr(item, position_attr, None)
+            if item.feature is None:
+                raise InvalidMultimodalDataError(
+                    f"Gemma4 {modality} item {item_idx} has no processor feature"
+                )
+            try:
+                features = [
+                    torch.as_tensor(feature)
+                    for feature in flatten_nested_list([item.feature])
+                ]
+                position_tensors = (
+                    [
+                        torch.as_tensor(position_ids)
+                        for position_ids in flatten_nested_list([position_values])
+                    ]
+                    if position_values is not None
+                    else []
+                )
+            except (RuntimeError, TypeError, ValueError) as e:
+                raise InvalidMultimodalDataError(
+                    f"Gemma4 {modality} item {item_idx} has invalid processor data: {e}"
+                ) from e
+
+            has_external_cache_key = (
+                item.has_external_cache_key and item.hash is not None
+            )
+            item.has_external_cache_key = False
+            if not has_external_cache_key:
+                # Processor-output items are hashed before model validation.
+                # Recompute internal keys with Gemma's position-aware modifier.
+                item.hash = None
+                item.pad_value = None
+                item.set(
+                    "_cache_key_modifier",
+                    _get_visual_cache_modifier(modality, features, position_tensors),
+                )
+            if position_values is None:
+                raise InvalidMultimodalDataError(
+                    f"Gemma4 {modality} item {item_idx} is missing {position_attr}"
+                )
+            if len(features) != len(position_tensors):
+                raise InvalidMultimodalDataError(
+                    f"Gemma4 {modality} item {item_idx} has {len(features)} feature "
+                    f"tensor(s) for {len(position_tensors)} position tensor(s)"
+                )
+
+            vision_config = getattr(self.hf_config, "vision_config", None)
+            pooling_kernel_size = getattr(vision_config, "pooling_kernel_size", None)
+            if not isinstance(pooling_kernel_size, int) or pooling_kernel_size <= 0:
+                raise RuntimeError(
+                    "Gemma4 vision config has invalid pooling_kernel_size="
+                    f"{pooling_kernel_size!r}"
+                )
+            embedding_counts = []
+            video_counts = []
+            for feature, position_ids in zip(features, position_tensors, strict=True):
+                if feature.ndim == 2:
+                    feature = feature.unsqueeze(0)
+                if position_ids.ndim == 2:
+                    position_ids = position_ids.unsqueeze(0)
+                if modality == "video" and feature.ndim == 4:
+                    feature = feature.reshape(
+                        -1, feature.shape[-2], feature.shape[-1]
+                    )
+                if modality == "video" and position_ids.ndim == 4:
+                    position_ids = position_ids.reshape(
+                        -1, position_ids.shape[-2], position_ids.shape[-1]
+                    )
+                if (
+                    feature.ndim != 3
+                    or position_ids.ndim != 3
+                    or position_ids.shape[-1] != 2
+                    or feature.shape[:2] != position_ids.shape[:2]
+                ):
+                    raise InvalidMultimodalDataError(
+                        f"Gemma4 {modality} item {item_idx} has incompatible feature shape "
+                        f"{tuple(feature.shape)} and {position_attr} shape "
+                        f"{tuple(position_ids.shape)}"
+                    )
+
+                input_seq_len = feature.shape[1]
+                output_length = input_seq_len // pooling_kernel_size**2
+                if input_seq_len == output_length:
+                    masks = (position_ids == -1).all(dim=-1)
+                    tensor_counts = [mask.sum().item() for mask in masks]
+                else:
+                    try:
+                        pooling_indices, _ = get_gemma4_vision_pooling_indices(
+                            position_ids, input_seq_len, output_length
+                        )
+                    except ValueError as e:
+                        raise InvalidMultimodalDataError(
+                            f"Gemma4 {modality} item {item_idx} has invalid pooling "
+                            f"geometry: {e}"
+                        ) from e
+                    if pooling_indices.max().item() >= output_length:
+                        raise InvalidMultimodalDataError(
+                            f"Gemma4 {modality} item {item_idx} has pooled position outside "
+                            f"the valid range [0, {output_length})"
+                        )
+                    tensor_counts = [
+                        torch.unique(indices).numel() for indices in pooling_indices
+                    ]
+
+                if modality == "video":
+                    video_counts.append((tensor_counts, input_seq_len))
+                else:
+                    embedding_counts.extend(
+                        (count, input_seq_len) for count in tensor_counts
+                    )
+
+            if modality == "video":
+                if len(item.offsets or []) == len(video_counts):
+                    embedding_counts = [
+                        (sum(counts), len(counts) * input_seq_len)
+                        for counts, input_seq_len in video_counts
+                    ]
+                else:
+                    embedding_counts = [
+                        (count, input_seq_len)
+                        for counts, input_seq_len in video_counts
+                        for count in counts
+                    ]
+
+            if item.offsets is None or len(item.offsets) != len(embedding_counts):
+                raise InvalidMultimodalDataError(
+                    f"Gemma4 {modality} item {item_idx} has {len(item.offsets or [])} "
+                    f"token span(s) for {len(embedding_counts)} input(s)"
+                )
+
+            for input_idx, ((num_embeddings, num_patches), (start, end)) in enumerate(
+                zip(embedding_counts, item.offsets, strict=True)
+            ):
+                num_placeholders = end - start + 1
+                if num_placeholders != num_embeddings:
+                    raise InvalidMultimodalDataError(
+                        f"Gemma4 {modality} token count mismatch before scheduling: "
+                        f"item={item_idx}, input={input_idx}, "
+                        f"placeholders={num_placeholders}, embeddings={num_embeddings}, "
+                        f"patches={num_patches}, "
+                        f"pooling_kernel_size={pooling_kernel_size}"
+                    )
+
+    @staticmethod
+    def _validate_precomputed_image_token_counts(mm_items) -> None:
+        for item_idx, item in enumerate(mm_items):
+            if not item.is_image() or not item.is_precomputed_embedding():
+                continue
+
+            if item.feature is None:
+                raise InvalidMultimodalDataError(
+                    f"Gemma4 precomputed image item {item_idx} has no embedding"
+                )
+            embedding = torch.as_tensor(item.feature)
+            if embedding.ndim < 2:
+                raise InvalidMultimodalDataError(
+                    f"Gemma4 precomputed image item {item_idx} has invalid embedding "
+                    f"shape {tuple(embedding.shape)}"
+                )
+            num_embeddings = embedding.reshape(-1, embedding.shape[-1]).shape[0]
+            num_placeholders = sum(
+                end - start + 1 for start, end in item.offsets or []
+            )
+            if num_placeholders != num_embeddings:
+                raise InvalidMultimodalDataError(
+                    "Gemma4 precomputed image token count mismatch: "
+                    f"item={item_idx}, placeholders={num_placeholders}, "
+                    f"embeddings={num_embeddings}"
+                )
 
     def _video_decoder_to_tensor(self, vdw: VideoDecoderWrapper) -> torch.Tensor:
         """Convert a VideoDecoderWrapper to a (sampled_frames, C, H, W) uint8 tensor.
@@ -148,6 +353,8 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
+        self._validate_visual_token_counts(mm_items)
+        self._validate_precomputed_image_token_counts(mm_items)
 
         return MultimodalProcessorOutput(
             input_ids=input_ids.tolist(),
