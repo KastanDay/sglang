@@ -1,0 +1,21 @@
+python/sglang/srt/observability/cache_reuse.py
+  s_289dc44b546457::t_df553c0a527882 120-121
+test/registered/unit/test_cache_reuse.py
+  s_289dc44b546457::t_7a819fd6c8c09d 44-47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ca30e17ab6e1583035ca5da4866a8ec0ee8d981f",
+  "prompts": {},
+  "sessions": {
+    "s_289dc44b546457": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f3d3-c4f3-7fc1-8ec7-c4383ca51bac",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    }
+  }
+}
