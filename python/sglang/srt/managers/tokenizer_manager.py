@@ -2454,6 +2454,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 else 0
             )
 
+            if (
+                self.server_args.enable_cache_observability
+                and self.disaggregation_mode != DisaggregationMode.DECODE
+            ):
+                finished = recv_obj.finished_reasons[i] or {}
+                self.metrics_collector.cache_reuse.observe(
+                    recv_obj.prompt_tokens[i],
+                    recv_obj.cached_tokens[i],
+                    cached_tokens_details,
+                    "aborted" if finished.get("type") == "abort" else "observed",
+                )
+
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 recv_obj.prompt_tokens[i],

@@ -1424,6 +1424,9 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels or {}
+        from sglang.srt.observability.cache_reuse import CacheReuseCollector
+
+        self.cache_reuse = CacheReuseCollector(self.labels)
 
         self.prompt_tokens_total = Counter(
             name="sglang:prompt_tokens_total",
@@ -1746,6 +1749,12 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.prefetch_stage_tokens = Counter(
+            name="sglang:storage_prefetch_stage_tokens",
+            documentation="Logical prefetch stages at publication decision, recorded by one attention leader; not consumption.",
+            labelnames=[*labels, "stage"],
+        )
+
         self.storage_prefetch_timeout_fallbacks_total = Counter(
             name="sglang:storage_prefetch_timeout_fallbacks_total",
             documentation="Number of L3 storage prefetches that reached the "
@@ -1810,6 +1819,13 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
+
+    def log_prefetch_stages(self, requested, found, returned, published):
+        from sglang.srt.observability.cache_reuse import prefetch_stages
+
+        stages = prefetch_stages(requested, found, returned, published)
+        for stage, amount in stages.items():
+            self.prefetch_stage_tokens.labels(**self.labels, stage=stage).inc(amount)
 
     def log_storage_prefetch_timeout_fallback(self):
         self.storage_prefetch_timeout_fallbacks_total.labels(**self.labels).inc()

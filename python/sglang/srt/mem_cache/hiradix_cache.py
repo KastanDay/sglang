@@ -110,6 +110,7 @@ class HiRadixCache(RadixCache):
         self.pp_size = params.pp_size
         self.enable_storage = server_args.hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
+        self.enable_cache_observability = server_args.enable_cache_observability
         self.extra_metric_labels = server_args.extra_metric_labels
 
         (
@@ -175,6 +176,8 @@ class HiRadixCache(RadixCache):
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        self.prefetch_sources_by_reqid = {}
+        self.cache_controller.cache_observability = self.enable_cache_observability
         self.work_list: List[torch.distributed.Work] = []
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
@@ -705,6 +708,7 @@ class HiRadixCache(RadixCache):
         self.token_to_kv_pool_host.clear()
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
+        self.prefetch_sources_by_reqid.clear()
         self.evictable_host_leaves.clear()
         super().reset()
 
@@ -1399,6 +1403,17 @@ class HiRadixCache(RadixCache):
             completed_tokens_tensor, torch.distributed.ReduceOp.MIN
         )
         min_completed_tokens = completed_tokens_tensor.item()
+        if self.enable_cache_observability:
+            pages = min_completed_tokens // self.page_size
+            codes = (operation.read_source_codes + [8] * pages)[:pages]
+            if self.pp_size > 1:
+                codes = [8] * pages
+            if pages:
+                source_tensor = torch.tensor(codes, dtype=torch.int)
+                self._all_reduce_attn_groups(
+                    source_tensor, torch.distributed.ReduceOp.BOR
+                )
+                codes = source_tensor.tolist()
         fetched_key = prefetch_key[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
         matched_length = self._insert_helper_host(
@@ -1419,9 +1434,31 @@ class HiRadixCache(RadixCache):
         # Track tokens actually loaded from storage for this request (L3 hits)
         loaded_from_storage = min_completed_tokens - matched_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+        if self.enable_cache_observability:
+            self.prefetch_sources_by_reqid[req_id] = (
+                codes[matched_length // self.page_size :],
+                self.page_size,
+            )
 
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
+            cp_rank, _ = self.cache_controller.get_attn_cp_rank_and_size()
+            observed = getattr(
+                self.storage_metrics_collector, "log_prefetch_stages", None
+            )
+            if (
+                self.enable_cache_observability
+                and observed is not None
+                and self.cache_controller.tp_rank == 0
+                and self.pp_rank == 0
+                and cp_rank == 0
+            ):
+                observed(
+                    len(prefetch_key),
+                    operation.observed_found_tokens,
+                    completed_tokens,
+                    min_completed_tokens,
+                )
 
         return True
 
@@ -1441,6 +1478,9 @@ class HiRadixCache(RadixCache):
         This should be called after check_prefetch_progress() returns True.
         """
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
+
+    def pop_prefetch_sources(self, req_id):
+        return self.prefetch_sources_by_reqid.pop(req_id, None)
 
     def match_prefix(self, params: MatchPrefixParams):
         if self.disable:
@@ -1721,6 +1761,7 @@ class HiRadixCache(RadixCache):
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        self.prefetch_sources_by_reqid.pop(rid, None)
 
         if rid not in self.ongoing_prefetch:
             return
