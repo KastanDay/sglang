@@ -1,0 +1,19 @@
+test/registered/unit/test_cache_reuse.py
+  s_289dc44b546457::t_3b5c4100489839 3,7,11-20,249-252
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f0ccccc4c95287699c44d651897d37c14a2a95ad",
+  "prompts": {},
+  "sessions": {
+    "s_289dc44b546457": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f3d3-c4f3-7fc1-8ec7-c4383ca51bac",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    }
+  }
+}
