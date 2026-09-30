@@ -1743,16 +1743,16 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
 
         self.labels = labels
 
-        self.prefetched_tokens_total = Counter(
-            name="sglang:prefetched_tokens_total",
-            documentation="Number of prefetched prompt tokens.",
-            labelnames=labels.keys(),
-        )
-
         self.prefetch_stage_tokens = Counter(
             name="sglang:storage_prefetch_stage_tokens",
             documentation="Logical prefetch stages at publication decision, recorded by one attention leader; not consumption.",
             labelnames=[*labels, "stage"],
+        )
+
+        self.prefetched_tokens_total = Counter(
+            name="sglang:prefetched_tokens_total",
+            documentation="Number of prefetched prompt tokens.",
+            labelnames=labels.keys(),
         )
 
         self.storage_prefetch_timeout_fallbacks_total = Counter(
@@ -1820,19 +1820,19 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
 
-    def log_prefetch_stages(self, requested, found, returned, published):
-        from sglang.srt.observability.cache_reuse import prefetch_stages
-
-        stages = prefetch_stages(requested, found, returned, published)
-        for stage, amount in stages.items():
-            self.prefetch_stage_tokens.labels(**self.labels, stage=stage).inc(amount)
-
     def log_storage_prefetch_timeout_fallback(self):
         self.storage_prefetch_timeout_fallbacks_total.labels(**self.labels).inc()
 
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:
             self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
+
+    def log_prefetch_stages(self, requested, found, returned, published):
+        from sglang.srt.observability.cache_reuse import prefetch_stages
+
+        stages = prefetch_stages(requested, found, returned, published)
+        for stage, amount in stages.items():
+            self.prefetch_stage_tokens.labels(**self.labels, stage=stage).inc(amount)
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)

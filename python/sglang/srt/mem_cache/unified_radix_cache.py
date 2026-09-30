@@ -2101,6 +2101,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 codes[insert_result.prefix_len // self.page_size :],
                 self.page_size,
             )
+            if self.enable_storage_metrics and self.storage_metrics_collector is not None:
+                cp_rank, _ = self.cache_controller.get_attn_cp_rank_and_size()
+                observed = getattr(
+                    self.storage_metrics_collector, "log_prefetch_stages", None
+                )
+                if (
+                    observed is not None
+                    and self.cache_controller.tp_rank == 0
+                    and self.pp_rank == 0
+                    and cp_rank == 0
+                ):
+                    observed(
+                        len(prefetch_key),
+                        operation.observed_found_tokens,
+                        completed_tokens,
+                        min_completed_tokens,
+                    )
         logger.info(
             "HiCache prefetch success req=%s completed_local=%d completed_synced=%d matched=%d loaded=%d tail_release=%d occupied=%d",
             req_id,
@@ -2113,23 +2130,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
-            cp_rank, _ = self.cache_controller.get_attn_cp_rank_and_size()
-            observed = getattr(
-                self.storage_metrics_collector, "log_prefetch_stages", None
-            )
-            if (
-                self.enable_cache_observability
-                and observed is not None
-                and self.cache_controller.tp_rank == 0
-                and self.pp_rank == 0
-                and cp_rank == 0
-            ):
-                observed(
-                    len(prefetch_key),
-                    operation.observed_found_tokens,
-                    completed_tokens,
-                    min_completed_tokens,
-                )
             if (
                 getattr(operation, "prefetch_timed_out", False)
                 and min_completed_tokens < len(prefetch_key)
