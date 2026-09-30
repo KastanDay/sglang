@@ -1,11 +1,23 @@
 import ast
 import importlib.util
+import sys
 import threading
 from pathlib import Path
 
+import pytest
 from prometheus_client import CollectorRegistry, generate_latest
 
 source = Path(__file__).parents[3] / "python/sglang/srt/observability/cache_reuse.py"
+registry_source = source.parents[2] / "test/ci/ci_register.py"
+registry_spec = importlib.util.spec_from_file_location(
+    "cache_reuse_ci_registry", registry_source
+)
+registry_module = importlib.util.module_from_spec(registry_spec)
+sys.modules[registry_spec.name] = registry_module
+registry_spec.loader.exec_module(registry_module)
+register_cpu_ci = registry_module.register_cpu_ci
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
 spec = importlib.util.spec_from_file_location("cache_reuse", source)
 cache_reuse = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cache_reuse)
@@ -234,3 +246,7 @@ def test_actual_connector_receipts_flow_to_consumed_export():
         in text
     )
     assert "first" not in text and "second" not in text
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))
