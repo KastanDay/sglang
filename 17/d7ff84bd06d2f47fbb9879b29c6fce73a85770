@@ -1,0 +1,51 @@
+python/sglang/srt/managers/cache_controller.py
+  s_289dc44b546457::t_68687cb3e368f8 167-168,196,201-202,238,906-909,911-917,926-928,1062
+python/sglang/srt/managers/schedule_batch.py
+  s_289dc44b546457::t_6233550428b829 998
+python/sglang/srt/managers/scheduler.py
+  s_289dc44b546457::t_7f6298dd20f8bb 2864-2866
+python/sglang/srt/managers/scheduler_components/output_streamer.py
+  s_289dc44b546457::t_02efa005eca557 79-86
+python/sglang/srt/managers/tokenizer_manager.py
+  s_79cb50fc6aadd5::t_38f029f4c8b83d 2457-2468
+python/sglang/srt/mem_cache/hiradix_cache.py
+  s_289dc44b546457::t_fbf2e3ba61b81e 113,179-180,711,1406-1416,1437-1441,1445-1461,1482-1484,1764
+python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py
+  s_289dc44b546457::t_a170147a6ffd1f 141,146-147,660-689
+python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py
+  s_289dc44b546457::t_08c14260572411 5,365,865-880,998-1010,1290-1306
+python/sglang/srt/mem_cache/unified_radix_cache.py
+  s_289dc44b546457::t_dabac872687159 329,472,541-542,2059-2069,2099-2103,2116-2132,2151-2153,2156
+python/sglang/srt/observability/cache_reuse.py
+  s_289dc44b546457::t_b385ab57787c1f 1-138
+python/sglang/srt/observability/metrics_collector.py
+  s_289dc44b546457::t_f870cc3be28d1a 1427-1429,1752-1757,1823-1829
+python/sglang/srt/server_args.py
+  s_289dc44b546457::t_0655b8a7b752c8 1031-1034
+test/registered/unit/test_cache_reuse.py
+  s_289dc44b546457::t_998c8be9b8c51e 1-232
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "17d7ff84bd06d2f47fbb9879b29c6fce73a85770",
+  "prompts": {},
+  "sessions": {
+    "s_289dc44b546457": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f3d3-c4f3-7fc1-8ec7-c4383ca51bac",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    },
+    "s_79cb50fc6aadd5": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f16740bddffea3JwqpnNQvsYBz",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    }
+  }
+}
