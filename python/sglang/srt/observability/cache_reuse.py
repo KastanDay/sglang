@@ -117,7 +117,8 @@ class CacheReuseCollector:
         reused = sum(
             amount for source, amount in partition.items() if source != "computed"
         )
-        self.requests.labels(**self.labels, hit="yes" if reused else "no").inc()
+        self.requests.labels(**self.labels, hit="yes").inc(bool(reused))
+        self.requests.labels(**self.labels, hit="no").inc(not reused)
         self.prefix.labels(**self.labels, source="all").observe(reused)
         for source, amount in partition.items():
             self.tokens.labels(**self.labels, source=source).inc(amount)

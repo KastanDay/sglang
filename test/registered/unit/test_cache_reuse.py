@@ -41,6 +41,10 @@ def test_denominator_includes_no_hits_and_each_tier_gets_zero_observations():
     registry = CollectorRegistry()
     collector = cache_reuse.CacheReuseCollector({"model_name": "test"}, registry)
     collector.observe(100, 0, None)
+    assert (
+        'sglang:committed_prefill_requests_total{hit="yes",model_name="test"} 0.0'
+        in generate_latest(registry).decode()
+    )
     collector.observe(100, 50, {"storage": 50})
     text = generate_latest(registry).decode()
     assert (
