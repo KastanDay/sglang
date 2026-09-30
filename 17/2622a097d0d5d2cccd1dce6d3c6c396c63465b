@@ -1,0 +1,21 @@
+python/sglang/srt/mem_cache/unified_radix_cache.py
+  s_289dc44b546457::t_dbc258f3229026 2104-2120
+python/sglang/srt/observability/metrics_collector.py
+  s_289dc44b546457::t_67e6571a184309 1752-1757,1830-1836
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "172622a097d0d5d2cccd1dce6d3c6c396c63465b",
+  "prompts": {},
+  "sessions": {
+    "s_289dc44b546457": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f3d3-c4f3-7fc1-8ec7-c4383ca51bac",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    }
+  }
+}
