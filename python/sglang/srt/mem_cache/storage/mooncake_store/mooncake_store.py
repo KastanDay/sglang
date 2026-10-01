@@ -2,6 +2,7 @@ import ctypes
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from collections.abc import Sequence
@@ -311,7 +312,6 @@ class MooncakeBaseStore:
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
-
     @staticmethod
     def _standalone_required_bytes(mem_pool: Any) -> int:
         """Compute total bytes of host buffers that must be visible to the real client.
@@ -362,6 +362,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
     ):
         MooncakeBaseStore.__init__(self)
+        self._receipt_context = threading.local()
         MooncakeDistributedStore = self._import_mooncake_store()
         self._replicate_config_cls, self._supports_group_ids = (
             self._import_mooncake_group_semantics()
@@ -861,6 +862,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
         return results
 
+    def batch_get_v2_with_sources(self, transfers, extra_info=None):
+        results, sources = {}, {}
+        for transfer in transfers:
+            self._receipt_context.calls = []
+            try:
+                current = self.batch_get_v2([transfer], extra_info)
+                results.update(current)
+                from sglang.srt.observability.cache_reuse import group_receipts
+
+                sources[transfer.name] = group_receipts(
+                    self._receipt_context.calls, len(transfer.keys or [])
+                )
+            finally:
+                self._receipt_context.calls = None
+        return results, sources
+
     def batch_get_v2(
         self,
         transfers: List[PoolTransfer],
@@ -977,6 +994,19 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
             for group in result_groups
         ]
+
+    def batch_get_v1_with_sources(self, keys, indices, extra_info=None):
+        self._receipt_context.calls = []
+        try:
+            results = self.batch_get_v1(keys, indices, extra_info)
+            from sglang.srt.observability.cache_reuse import group_receipts
+
+            codes = group_receipts(self._receipt_context.calls, len(keys))
+            if getattr(getattr(self, "mem_pool_host", None), "kv_buffer", True) is None:
+                codes = [0] * len(keys)
+            return results, codes
+        finally:
+            self._receipt_context.calls = None
 
     def batch_get_v1(
         self,
@@ -1257,6 +1287,23 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
+        calls = getattr(self._receipt_context, "calls", None)
+        if calls is not None:
+            method_name = (
+                "batch_get_into_multi_buffers"
+                if self._uses_multi_buffer(buffer_ptrs)
+                else "batch_get_into"
+            )
+            observed = getattr(self.store, method_name + "_with_sources", None)
+            if observed is not None:
+                results, sources = observed(key_strs, buffer_ptrs, buffer_sizes)
+            else:
+                results = getattr(self.store, method_name)(
+                    key_strs, buffer_ptrs, buffer_sizes
+                )
+                sources = ["unknown"] * len(key_strs)
+            calls.append((results, sources))
+            return results
         if self._uses_multi_buffer(buffer_ptrs):
             return self.store.batch_get_into_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes

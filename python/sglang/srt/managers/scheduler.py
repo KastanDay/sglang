@@ -2861,6 +2861,11 @@ class Scheduler(
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
                     req.rid
                 )
+                source_receipt = getattr(self.tree_cache, "pop_prefetch_sources", None)
+                if source_receipt is not None:
+                    sources = source_receipt(req.rid)
+                    if not req._cache_breakdown_computed and not req.retracted_stain:
+                        req.storage_hit_sources = sources
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(

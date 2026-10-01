@@ -326,6 +326,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.init_metrics_collector()
         self._enable_metrics_flag = params.enable_metrics
         self.enable_storage_metrics = False
+        self.enable_cache_observability = False
         self.storage_metrics_collector: Optional[StorageMetricsCollector] = None
         self.extra_metric_labels = None
 
@@ -468,6 +469,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        self.prefetch_sources_by_reqid = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
 
@@ -506,6 +508,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.load_cache_event = threading.Event()
         self.sidecar_pool_specs.clear()
         self.extra_metric_labels = server_args.extra_metric_labels
+        self.served_model_name = server_args.served_model_name
 
         # Parse storage config once, share with assembler and tree
         storage_backend = server_args.hicache_storage_backend
@@ -536,6 +539,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             storage_extra_config=storage_extra_config,
             storage_prefetch_threshold=storage_prefetch_threshold,
         )
+        self.enable_cache_observability = server_args.enable_cache_observability
+        self.cache_controller.cache_observability = self.enable_cache_observability
 
         # State initialization
         self.write_through_threshold = (
@@ -2052,6 +2057,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for i, p in enumerate(sidecar_pools, start=1):
                 hit_pages[p] = int(packed[i].item())
 
+        if self.enable_cache_observability:
+            pages = min_completed_tokens // self.page_size
+            codes = (operation.read_source_codes + [8] * pages)[:pages]
+            if self.pp_size > 1:
+                codes = [8] * pages
+            if pages:
+                source_tensor = torch.tensor(codes, dtype=torch.int)
+                self._all_reduce_attn_groups(
+                    source_tensor, torch.distributed.ReduceOp.BOR
+                )
+                codes = source_tensor.tolist()
         fetched_key = prefetch_key[:min_completed_tokens]
         insert_result = self._insert_helper_host(
             last_host_node,
@@ -2081,6 +2097,31 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         loaded_from_storage = min_completed_tokens - insert_result.prefix_len
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+        if self.enable_cache_observability:
+            self.prefetch_sources_by_reqid[req_id] = (
+                codes[insert_result.prefix_len // self.page_size :],
+                self.page_size,
+            )
+            if (
+                self.enable_storage_metrics
+                and self.storage_metrics_collector is not None
+            ):
+                cp_rank, _ = self.cache_controller.get_attn_cp_rank_and_size()
+                observed = getattr(
+                    self.storage_metrics_collector, "log_prefetch_stages", None
+                )
+                if (
+                    observed is not None
+                    and self.cache_controller.tp_rank == 0
+                    and self.pp_rank == 0
+                    and cp_rank == 0
+                ):
+                    observed(
+                        len(prefetch_key),
+                        operation.observed_found_tokens,
+                        completed_tokens,
+                        min_completed_tokens,
+                    )
         logger.info(
             "HiCache prefetch success req=%s completed_local=%d completed_synced=%d matched=%d loaded=%d tail_release=%d occupied=%d",
             req_id,
@@ -2111,8 +2152,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
+    def pop_prefetch_sources(self, req_id):
+        return self.prefetch_sources_by_reqid.pop(req_id, None)
+
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        self.prefetch_sources_by_reqid.pop(rid, None)
         if rid not in self.ongoing_prefetch:
             return
 
@@ -2292,6 +2337,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self.cache_controller.get_attn_cp_rank_and_size()
             )
             labels = {
+                "model_name": self.served_model_name,
                 "storage_backend": storage_backend,
                 "tp_rank": self.cache_controller.tp_rank,
                 "dp_rank": self.cache_controller.dp_rank,

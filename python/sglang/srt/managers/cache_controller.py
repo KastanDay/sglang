@@ -164,6 +164,8 @@ class StorageOperation:
         self.token_ids = token_ids
         self.last_hash = last_hash
         self.completed_tokens = 0
+        self.read_source_codes = []
+        self.observed_found_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
 
@@ -191,11 +193,13 @@ class PrefetchOperation(StorageOperation):
 
         super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
 
-    def increment(self, num_tokens: int):
+    def increment(self, num_tokens: int, source_codes=None):
         with self._lock:
             if self._terminated_flag:
                 return False
             self.completed_tokens += num_tokens
+            if source_codes is not None:
+                self.read_source_codes.extend(source_codes)
             return True
 
     def mark_terminate(self):
@@ -231,6 +235,7 @@ class HiCacheController:
         self.attn_tp_group = attn_tp_group
         self.pp_group = pp_group
         self.prefetch_sync_groups: List[torch.distributed.ProcessGroup] = []
+        self.cache_observability = False
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -898,9 +903,18 @@ class HiCacheController:
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
     ):
-        results = self.storage_backend.batch_get_v1(
-            hash_values, host_indices, extra_info
+        observed = (
+            getattr(self.storage_backend, "batch_get_v1_with_sources", None)
+            if self.cache_observability
+            else None
         )
+        if observed is not None:
+            results, sources = observed(hash_values, host_indices, extra_info)
+        else:
+            results = self.storage_backend.batch_get_v1(
+                hash_values, host_indices, extra_info
+            )
+            sources = [8] * len(hash_values) if self.cache_observability else None
         inc = 0
         for i in range(len(hash_values)):
             if not results[i]:
@@ -909,7 +923,9 @@ class HiCacheController:
                 )
                 break
             inc += self.page_size
-        operation.increment(inc)
+        operation.increment(
+            inc, sources[: inc // self.page_size] if sources is not None else None
+        )
 
     # todo: deprecate
     def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
@@ -1043,6 +1059,7 @@ class HiCacheController:
                     storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
                 )
                 storage_hit_count = storage_hit_count_tensor.item()
+                operation.observed_found_tokens = storage_hit_count
 
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits

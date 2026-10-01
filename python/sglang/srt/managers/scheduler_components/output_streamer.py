@@ -76,6 +76,14 @@ class SchedulerOutputStreamer:
             # decode via metadata, while decode may not have a local storage backend.
             if req.cached_tokens_storage > 0 or self.enable_hicache_storage():
                 details["storage"] = req.cached_tokens_storage
+                sources = getattr(req, "storage_hit_sources", None)
+                if sources is not None:
+                    from sglang.srt.observability.cache_reuse import summarize_sources
+
+                    codes, page_size = sources
+                    details["storage_sources"] = summarize_sources(
+                        codes, req.cached_tokens_storage, page_size
+                    )
             if self.enable_hicache_storage():
                 details["storage_backend"] = self._get_storage_backend_type()
             return details

@@ -138,11 +138,13 @@ class PrefetchOperation(StorageOperation):
         )
         self.pool_transfers_done = not bool(pool_transfers)
 
-    def increment(self, num_tokens: int):
+    def increment(self, num_tokens: int, source_codes=None):
         with self._lock:
             if self._terminated_flag:
                 return False
             self.completed_tokens += num_tokens
+            if source_codes is not None:
+                self.read_source_codes.extend(source_codes)
             return True
 
     def mark_terminate(self):
@@ -655,7 +657,36 @@ class HybridCacheController(BaseHiCacheController):
                 operation.pool_transfers, operation.hash_value, kv_completed_pages
             )
             self._resolve_sidecar_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_get_v2(operation.pool_transfers)
+            observed = (
+                getattr(self.storage_backend, "batch_get_v2_with_sources", None)
+                if self.cache_observability
+                else None
+            )
+            if observed is not None:
+                results, sources = observed(operation.pool_transfers)
+            else:
+                results = self.storage_backend.batch_get_v2(operation.pool_transfers)
+                sources = {}
+            if self.cache_observability:
+                page_indices = {
+                    key: index for index, key in enumerate(operation.hash_value)
+                }
+                for transfer in operation.pool_transfers:
+                    if transfer.name == PoolName.DRAFT:
+                        continue
+                    if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                        operation.read_source_codes = [
+                            code | 8 for code in operation.read_source_codes
+                        ]
+                        continue
+                    keys = transfer.keys or []
+                    receipt = sources.get(transfer.name, [])
+                    if len(receipt) != len(keys):
+                        receipt = [8] * len(keys)
+                    for key, code in zip(keys, receipt):
+                        index = page_indices.get(key)
+                        if index is not None and index < len(operation.read_source_codes):
+                            operation.read_source_codes[index] |= code
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
         operation.pool_transfers_done = True
 

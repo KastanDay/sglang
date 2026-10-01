@@ -1028,6 +1028,10 @@ class ServerArgs:
     ] = None
     show_time_cost: A[bool, "Show time cost of custom marks."] = False
     enable_metrics: A[bool, "Enable log prometheus metrics."] = False
+    enable_cache_observability: A[
+        bool,
+        "Opt-in committed logical cache-tier metrics and per-prefetch read-source synchronization. Requires metrics and a validated storage receipt SDK for known Store tiers.",
+    ] = False
     grpc_http_sidecar_port: A[
         Optional[int],
         "Port for the HTTP sidecar server in gRPC mode (--grpc-mode). Serves Prometheus metrics and profiling endpoints. Defaults to --port + 1. Not used in HTTP mode.",

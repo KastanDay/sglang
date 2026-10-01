@@ -1,0 +1,475 @@
+import ast
+import importlib.util
+import sys
+import threading
+from pathlib import Path
+
+import pytest
+from prometheus_client import CollectorRegistry, generate_latest
+
+source = Path(__file__).parents[3] / "python/sglang/srt/observability/cache_reuse.py"
+registry_source = source.parents[2] / "test/ci/ci_register.py"
+registry_spec = importlib.util.spec_from_file_location(
+    "cache_reuse_ci_registry", registry_source
+)
+registry_module = importlib.util.module_from_spec(registry_spec)
+sys.modules[registry_spec.name] = registry_module
+registry_spec.loader.exec_module(registry_module)
+register_cpu_ci = registry_module.register_cpu_ci
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+spec = importlib.util.spec_from_file_location("cache_reuse", source)
+cache_reuse = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cache_reuse)
+
+
+def test_tiers_are_disjoint_and_unknown_is_not_zero():
+    result = cache_reuse.committed_reuse(
+        100,
+        80,
+        {
+            "device": 10,
+            "host": 20,
+            "storage": 50,
+            "storage_sources": {"store_dram": 20, "store_ssd": 15, "store_mixed": 10},
+        },
+    )
+    assert sum(result.values()) == 100
+    assert result["computed"] == 20
+    assert result["store_unknown"] == 5
+    assert cache_reuse.committed_reuse(100, 80, None)["reuse_unknown"] == 80
+
+
+def test_promotions_and_invalid_shards_do_not_double_count():
+    result = cache_reuse.committed_reuse(
+        10, 100, {"device": 10, "host": 10, "storage": 10}
+    )
+    assert sum(result.values()) == 10
+    assert result["gpu"] == 10
+    assert result["host"] == result["store_unknown"] == 0
+
+
+def test_denominator_includes_no_hits_and_each_tier_gets_zero_observations():
+    registry = CollectorRegistry()
+    collector = cache_reuse.CacheReuseCollector({"model_name": "test"}, registry)
+    collector.observe(100, 0, None)
+    assert (
+        'sglang:committed_prefill_requests_total{hit="yes",model_name="test"} 0.0'
+        in generate_latest(registry).decode()
+    )
+    collector.observe(100, 50, {"storage": 50})
+    text = generate_latest(registry).decode()
+    assert (
+        'sglang:committed_prefill_requests_total{hit="no",model_name="test"} 1.0'
+        in text
+    )
+    assert (
+        'sglang:committed_prefill_requests_total{hit="yes",model_name="test"} 1.0'
+        in text
+    )
+    assert (
+        'sglang:committed_cache_prefix_tokens_count{model_name="test",source="all"} 2.0'
+        in text
+    )
+    assert (
+        'sglang:committed_input_tokens_total{model_name="test",source="computed"} 150.0'
+        in text
+    )
+
+
+def test_prefetch_deadline_is_not_consumption():
+    assert list(cache_reuse.prefetch_stages(100, 80, 70, 30).values()) == [
+        100,
+        80,
+        70,
+        30,
+    ]
+    assert cache_reuse.prefetch_stages(100, 200, 300, 400)["published"] == 100
+
+
+def test_receipts_union_components_and_truncate_to_consumed_pages():
+    codes = cache_reuse.group_receipts(
+        [([10, 10, 10, 10], ["memory", "local_disk", "memory", "memory"])], 2
+    )
+    assert codes == [3, 1]
+    assert cache_reuse.summarize_sources(codes, 3, 2) == {
+        "store_dram": 1,
+        "store_ssd": 0,
+        "store_mixed": 2,
+        "store_unknown": 0,
+    }
+
+
+def test_aborted_or_missing_usage_is_coverage_not_completed_consumption():
+    registry = CollectorRegistry()
+    collector = cache_reuse.CacheReuseCollector({"model_name": "test"}, registry)
+    collector.observe(100, 50, None, "aborted")
+    collector.observe(None, None, None)
+    text = generate_latest(registry).decode()
+    assert 'status="aborted"' in text
+    assert 'status="usage_unavailable"' in text
+    assert "sglang:committed_input_tokens_total{" not in text
+
+
+def test_absent_failed_malformed_or_incomplete_receipts_are_unknown():
+    assert cache_reuse.group_receipts([], 2) == [8, 8]
+    assert cache_reuse.group_receipts([([-1, 10], ["memory", "local_disk"])], 2) == [
+        8,
+        2,
+    ]
+    assert cache_reuse.group_receipts([([10], ["memory", "local_disk"])], 2) == [8, 8]
+    codes = cache_reuse.group_receipts(
+        [([10, 10], ["memory", "local_disk"]), ([10, 10], ["unknown", "memory"])], 2
+    )
+    assert codes == [9, 3]
+    assert cache_reuse.summarize_sources(codes, 4, 2)["store_unknown"] == 2
+
+
+def test_both_radix_implementations_pop_provenance_once():
+    from types import SimpleNamespace
+
+    for filename, class_name in (
+        ("hiradix_cache.py", "HiRadixCache"),
+        ("unified_radix_cache.py", "UnifiedRadixCache"),
+    ):
+        path = source.parents[1] / "mem_cache" / filename
+        tree = ast.parse(path.read_text())
+        selected = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+        )
+        method = next(
+            node
+            for node in selected.body
+            if isinstance(node, ast.FunctionDef) and node.name == "pop_prefetch_sources"
+        )
+        namespace = {}
+        module = ast.Module(body=[method], type_ignores=[])
+        eval(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+        instance = SimpleNamespace(prefetch_sources_by_reqid={"request": ([1, 2], 2)})
+        assert namespace[method.name](instance, "request") == ([1, 2], 2)
+        assert namespace[method.name](instance, "request") is None
+
+
+def connector_methods():
+    path = source.parents[1] / "mem_cache/storage/mooncake_store/mooncake_store.py"
+    tree = ast.parse(path.read_text())
+    methods = {
+        "batch_get_v1_with_sources",
+        "batch_get_v2_with_sources",
+        "_get_batch_zero_copy_impl",
+    }
+    selected = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "MooncakeStore"
+    )
+    selected.body = [
+        node
+        for node in selected.body
+        if isinstance(node, ast.FunctionDef) and node.name in methods
+    ]
+    selected.bases = []
+    selected.decorator_list = []
+    module = ast.Module(body=[selected], type_ignores=[])
+    namespace = {"List": list, "Any": object}
+    compiled = compile(ast.fix_missing_locations(module), str(path), "exec")
+    eval(compiled, namespace)
+    return namespace["MooncakeStore"]
+
+
+@pytest.mark.parametrize(
+    "filename,class_name",
+    [
+        ("hiradix_cache.py", "HiRadixCache"),
+        ("unified_radix_cache.py", "UnifiedRadixCache"),
+    ],
+)
+def test_actual_storage_exporter_labels_include_served_model(
+    monkeypatch, filename, class_name
+):
+    from functools import partial
+    from types import SimpleNamespace
+
+    from prometheus_client import Counter, Histogram
+
+    monkeypatch.setitem(
+        sys.modules, "sglang.srt.observability.cache_reuse", cache_reuse
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.server_args",
+        SimpleNamespace(get_global_server_args=lambda: SimpleNamespace()),
+    )
+    registry = CollectorRegistry()
+    metrics_path = source.with_name("metrics_collector.py")
+    metrics_tree = ast.parse(metrics_path.read_text())
+    collector_node = next(
+        node
+        for node in metrics_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "StorageMetricsCollector"
+    )
+    collector_node.bases = []
+    namespace = {}
+    future_annotations = ast.ImportFrom(
+        module="__future__", names=[ast.alias(name="annotations")], level=0
+    )
+    module = ast.Module(body=[future_annotations, collector_node], type_ignores=[])
+    eval(
+        compile(ast.fix_missing_locations(module), str(metrics_path), "exec"), namespace
+    )
+    collector = namespace["StorageMetricsCollector"]
+    collector._counter_cls = partial(Counter, registry=registry)
+    collector._histogram_cls = partial(Histogram, registry=registry)
+    radix_path = source.parents[1] / "mem_cache" / filename
+    radix_tree = ast.parse(radix_path.read_text())
+    radix_node = next(
+        node
+        for node in radix_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    method = next(
+        node
+        for node in radix_node.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_apply_storage_runtime_config"
+    )
+    namespace.update(
+        StorageMetricsCollector=collector,
+        STAT_LOGGER_ROLE_STORAGE="storage",
+        resolve_collector_class=lambda args, role, default: default,
+    )
+    module = ast.Module(body=[future_annotations, method], type_ignores=[])
+    eval(compile(ast.fix_missing_locations(module), str(radix_path), "exec"), namespace)
+    instance = SimpleNamespace(
+        served_model_name="served-model-fixture",
+        storage_metrics_collector=None,
+        page_size=16,
+        cache_controller=SimpleNamespace(
+            tp_rank=0,
+            dp_rank=0,
+            pp_rank=0,
+            pp_size=1,
+            get_attn_cp_rank_and_size=lambda: (0, 1),
+        ),
+    )
+    options = dict(
+        storage_backend="mooncake",
+        prefetch_threshold=256,
+        hicache_storage_pass_prefix_keys=False,
+        enable_storage=True,
+        enable_storage_metrics=True,
+        extra_metric_labels={"custom": "fixture"},
+    )
+    if filename == "hiradix_cache.py":
+        options["prefetch_timeout_config"] = SimpleNamespace()
+    else:
+        options.update(prefetch_timeout_base=1.0, prefetch_timeout_per_ki_token=0.25)
+    namespace[method.name](instance, **options)
+    actual = instance.storage_metrics_collector
+    assert actual.labels["model_name"] == "served-model-fixture"
+    actual.log_prefetch_stages(10, 8, 6, 4)
+    stages = [
+        sample
+        for family in registry.collect()
+        for sample in family.samples
+        if sample.name == "sglang:storage_prefetch_stage_tokens_total"
+    ]
+    assert len(stages) == 4
+    assert all(
+        sample.labels["model_name"] == "served-model-fixture" for sample in stages
+    )
+    assert all(sample.labels["custom"] == "fixture" for sample in stages)
+
+
+def test_actual_connector_preserves_old_sdk_and_fails_unknown():
+    import sys
+    from types import SimpleNamespace
+
+    sys.modules["sglang.srt.observability.cache_reuse"] = cache_reuse
+    connector = connector_methods()()
+    connector._receipt_context = threading.local()
+    connector._uses_multi_buffer = lambda buffers: False
+    connector.store = SimpleNamespace(
+        batch_get_into=lambda keys, buffers, sizes: [10] * len(keys)
+    )
+    connector.batch_get_v1 = lambda keys, indices, extra: [
+        result > 0
+        for result in connector._get_batch_zero_copy_impl(
+            keys, indices, [10] * len(keys)
+        )
+    ]
+    flags, codes = connector.batch_get_v1_with_sources(["opaque-key"], [1])
+    assert flags == [True]
+    assert codes == [8]
+    assert connector._receipt_context.calls is None
+    assert connector._get_batch_zero_copy_impl(["opaque-key"], [1], [10]) == [10]
+
+
+def test_actual_connector_receipts_flow_to_consumed_export():
+    import sys
+    from types import SimpleNamespace
+
+    sys.modules["sglang.srt.observability.cache_reuse"] = cache_reuse
+    connector = connector_methods()()
+    connector._receipt_context = threading.local()
+    connector._uses_multi_buffer = lambda buffers: False
+    connector.store = SimpleNamespace(
+        batch_get_into_with_sources=lambda keys, buffers, sizes: (
+            [10, 10],
+            ["memory", "local_disk"],
+        )
+    )
+    connector.batch_get_v1 = lambda keys, indices, extra: [
+        result > 0
+        for result in connector._get_batch_zero_copy_impl(
+            keys, indices, [10] * len(keys)
+        )
+    ]
+    flags, codes = connector.batch_get_v1_with_sources(["first", "second"], [1, 2])
+    assert flags == [True, True]
+    registry = CollectorRegistry()
+    collector = cache_reuse.CacheReuseCollector({"model_name": "test"}, registry)
+    collector.observe(
+        10,
+        3,
+        {"storage": 3, "storage_sources": cache_reuse.summarize_sources(codes, 3, 2)},
+    )
+    text = generate_latest(registry).decode()
+    assert (
+        'sglang:committed_input_tokens_total{model_name="test",source="store_dram"} 2.0'
+        in text
+    )
+    assert (
+        'sglang:committed_input_tokens_total{model_name="test",source="store_ssd"} 1.0'
+        in text
+    )
+    assert (
+        'sglang:committed_input_tokens_total{model_name="test",source="computed"} 7.0'
+        in text
+    )
+    assert "first" not in text and "second" not in text
+
+
+def runtime_method(path, class_name, method_name):
+    tree = ast.parse(path.read_text())
+    selected = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    return next(
+        node
+        for node in selected.body
+        if isinstance(node, ast.FunctionDef) and node.name == method_name
+    )
+
+
+@pytest.mark.parametrize("later_receipt", [([2, 2], 64), ([3, 3], 64), None])
+@pytest.mark.parametrize("retract", [False, True])
+def test_committed_storage_sources_survive_later_chunks_and_retraction(
+    monkeypatch, later_receipt, retract
+):
+    from types import SimpleNamespace
+
+    monkeypatch.setitem(
+        sys.modules, "sglang.srt.observability.cache_reuse", cache_reuse
+    )
+    managers = source.parents[1] / "managers"
+    scheduler = runtime_method(
+        managers / "scheduler.py", "Scheduler", "_get_new_batch_prefill_raw"
+    )
+    capture_block = next(
+        node
+        for node in ast.walk(scheduler)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Attribute)
+        and node.test.attr == "enable_hicache_storage"
+    )
+    capture = ast.parse(
+        "def capture(self, req):\n    for req in [req]:\n        pass"
+    ).body[0]
+    capture.body[0].body = [capture_block]
+    prepare = runtime_method(
+        managers / "schedule_batch.py", "ScheduleBatch", "prepare_for_extend"
+    )
+    committed_block = next(
+        node
+        for node in ast.walk(prepare)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.UnaryOp)
+        and isinstance(node.test.operand, ast.Attribute)
+        and node.test.operand.attr == "retracted_stain"
+    )
+    commit = ast.parse("def commit(req, pre_len, seq_len):\n    pass").body[0]
+    commit.body = [committed_block]
+    reset = runtime_method(managers / "schedule_batch.py", "Req", "reset_for_retract")
+    export = runtime_method(
+        managers / "scheduler_components/output_streamer.py",
+        "SchedulerOutputStreamer",
+        "get_cached_tokens_details",
+    )
+    future_annotations = ast.ImportFrom(
+        module="__future__", names=[ast.alias(name="annotations")], level=0
+    )
+    module = ast.Module(
+        body=[future_annotations, capture, commit, reset, export], type_ignores=[]
+    )
+    namespace = {"torch": SimpleNamespace(empty=lambda *args, **kwargs: [], int64=None)}
+    eval(compile(ast.fix_missing_locations(module), str(managers), "exec"), namespace)
+    receipts = iter([([1, 1], 64), later_receipt])
+    scheduler_instance = SimpleNamespace(
+        enable_hicache_storage=True,
+        tree_cache=SimpleNamespace(
+            check_prefetch_progress=lambda request_id: True,
+            pop_prefetch_loaded_tokens=lambda request_id: 128,
+            pop_prefetch_sources=lambda request_id: next(receipts),
+        ),
+    )
+    request = SimpleNamespace(
+        rid="private-request-fixture",
+        retracted_stain=False,
+        retraction_count=0,
+        _cache_breakdown_computed=False,
+        cached_tokens=0,
+        cached_tokens_device=0,
+        cached_tokens_host=0,
+        cached_tokens_storage=0,
+        already_computed=0,
+        prefix_indices=[0] * 128,
+        host_hit_length=128,
+        storage_hit_sources=None,
+        input_embeds=None,
+    )
+    namespace["capture"](scheduler_instance, request)
+    namespace["commit"](request, 128, 256)
+    assert request.cached_tokens_storage == 128
+    if retract:
+        namespace["reset_for_retract"](request)
+    request.prefix_indices = [0] * 256
+    namespace["capture"](scheduler_instance, request)
+    namespace["commit"](request, 256, 320)
+    assert list(receipts) == []
+    assert request.cached_tokens_storage == 128
+    details = namespace["get_cached_tokens_details"](
+        SimpleNamespace(enable_hicache_storage=lambda: False), request
+    )
+    assert details["storage_sources"] == {
+        "store_dram": 128,
+        "store_ssd": 0,
+        "store_mixed": 0,
+        "store_unknown": 0,
+    }
+    registry = CollectorRegistry()
+    collector = cache_reuse.CacheReuseCollector({"model_name": "test"}, registry)
+    collector.observe(256, request.cached_tokens, details)
+    text = generate_latest(registry).decode()
+    assert 'model_name="test",source="store_dram"} 128.0' in text
+    assert 'model_name="test",source="store_ssd"} 0.0' in text
+    assert 'model_name="test",source="store_mixed"} 0.0' in text
+    assert "private-request-fixture" not in text
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))
