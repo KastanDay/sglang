@@ -352,5 +352,124 @@ def test_actual_connector_receipts_flow_to_consumed_export():
     assert "first" not in text and "second" not in text
 
 
+def runtime_method(path, class_name, method_name):
+    tree = ast.parse(path.read_text())
+    selected = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    return next(
+        node
+        for node in selected.body
+        if isinstance(node, ast.FunctionDef) and node.name == method_name
+    )
+
+
+@pytest.mark.parametrize("later_receipt", [([2, 2], 64), ([3, 3], 64), None])
+@pytest.mark.parametrize("retract", [False, True])
+def test_committed_storage_sources_survive_later_chunks_and_retraction(
+    monkeypatch, later_receipt, retract
+):
+    from types import SimpleNamespace
+
+    monkeypatch.setitem(
+        sys.modules, "sglang.srt.observability.cache_reuse", cache_reuse
+    )
+    managers = source.parents[1] / "managers"
+    scheduler = runtime_method(
+        managers / "scheduler.py", "Scheduler", "_get_new_batch_prefill_raw"
+    )
+    capture_block = next(
+        node
+        for node in ast.walk(scheduler)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Attribute)
+        and node.test.attr == "enable_hicache_storage"
+    )
+    capture = ast.parse(
+        "def capture(self, req):\n    for req in [req]:\n        pass"
+    ).body[0]
+    capture.body[0].body = [capture_block]
+    prepare = runtime_method(
+        managers / "schedule_batch.py", "ScheduleBatch", "prepare_for_extend"
+    )
+    committed_block = next(
+        node
+        for node in ast.walk(prepare)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.UnaryOp)
+        and isinstance(node.test.operand, ast.Attribute)
+        and node.test.operand.attr == "retracted_stain"
+    )
+    commit = ast.parse("def commit(req, pre_len, seq_len):\n    pass").body[0]
+    commit.body = [committed_block]
+    reset = runtime_method(managers / "schedule_batch.py", "Req", "reset_for_retract")
+    export = runtime_method(
+        managers / "scheduler_components/output_streamer.py",
+        "SchedulerOutputStreamer",
+        "get_cached_tokens_details",
+    )
+    future_annotations = ast.ImportFrom(
+        module="__future__", names=[ast.alias(name="annotations")], level=0
+    )
+    module = ast.Module(
+        body=[future_annotations, capture, commit, reset, export], type_ignores=[]
+    )
+    namespace = {"torch": SimpleNamespace(empty=lambda *args, **kwargs: [], int64=None)}
+    eval(compile(ast.fix_missing_locations(module), str(managers), "exec"), namespace)
+    receipts = iter([([1, 1], 64), later_receipt])
+    scheduler_instance = SimpleNamespace(
+        enable_hicache_storage=True,
+        tree_cache=SimpleNamespace(
+            check_prefetch_progress=lambda request_id: True,
+            pop_prefetch_loaded_tokens=lambda request_id: 128,
+            pop_prefetch_sources=lambda request_id: next(receipts),
+        ),
+    )
+    request = SimpleNamespace(
+        rid="private-request-fixture",
+        retracted_stain=False,
+        retraction_count=0,
+        _cache_breakdown_computed=False,
+        cached_tokens=0,
+        cached_tokens_device=0,
+        cached_tokens_host=0,
+        cached_tokens_storage=0,
+        already_computed=0,
+        prefix_indices=[0] * 128,
+        host_hit_length=128,
+        storage_hit_sources=None,
+        input_embeds=None,
+    )
+    namespace["capture"](scheduler_instance, request)
+    namespace["commit"](request, 128, 256)
+    assert request.cached_tokens_storage == 128
+    if retract:
+        namespace["reset_for_retract"](request)
+    request.prefix_indices = [0] * 256
+    namespace["capture"](scheduler_instance, request)
+    namespace["commit"](request, 256, 320)
+    assert list(receipts) == []
+    assert request.cached_tokens_storage == 128
+    details = namespace["get_cached_tokens_details"](
+        SimpleNamespace(enable_hicache_storage=lambda: False), request
+    )
+    assert details["storage_sources"] == {
+        "store_dram": 128,
+        "store_ssd": 0,
+        "store_mixed": 0,
+        "store_unknown": 0,
+    }
+    registry = CollectorRegistry()
+    collector = cache_reuse.CacheReuseCollector({"model_name": "test"}, registry)
+    collector.observe(256, request.cached_tokens, details)
+    text = generate_latest(registry).decode()
+    assert 'model_name="test",source="store_dram"} 128.0' in text
+    assert 'model_name="test",source="store_ssd"} 0.0' in text
+    assert 'model_name="test",source="store_mixed"} 0.0' in text
+    assert "private-request-fixture" not in text
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
