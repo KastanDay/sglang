@@ -1,0 +1,21 @@
+python/sglang/srt/mem_cache/hiradix_cache.py
+  s_289dc44b546457::t_4fe4a3911150d6 115,313
+python/sglang/srt/mem_cache/unified_radix_cache.py
+  s_289dc44b546457::t_376210ea8f912a 511,2105-2108,2340
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a91fd1f05eb44575fe7d6499924f3b4e7047ced3",
+  "prompts": {},
+  "sessions": {
+    "s_289dc44b546457": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f3d3-c4f3-7fc1-8ec7-c4383ca51bac",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    }
+  }
+}
