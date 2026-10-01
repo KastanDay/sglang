@@ -1,0 +1,21 @@
+python/sglang/srt/managers/scheduler.py
+  s_289dc44b546457::t_10a382c4744a79 2866-2868
+test/registered/unit/test_cache_reuse.py
+  s_289dc44b546457::t_554581d3051ac7 355-473
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "052be1b48488f28bb5a4fe9514342d3653f56593",
+  "prompts": {},
+  "sessions": {
+    "s_289dc44b546457": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0f3d3-c4f3-7fc1-8ec7-c4383ca51bac",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Kastan Day <kastanvday@gmail.com>"
+    }
+  }
+}
