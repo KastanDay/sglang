@@ -112,6 +112,7 @@ class HiRadixCache(RadixCache):
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.enable_cache_observability = server_args.enable_cache_observability
         self.extra_metric_labels = server_args.extra_metric_labels
+        self.served_model_name = server_args.served_model_name
 
         (
             extra_config,
@@ -309,6 +310,7 @@ class HiRadixCache(RadixCache):
                 self.cache_controller.get_attn_cp_rank_and_size()
             )
             labels = {
+                "model_name": self.served_model_name,
                 "storage_backend": storage_backend,
                 "tp_rank": self.cache_controller.tp_rank,
                 "dp_rank": self.cache_controller.dp_rank,

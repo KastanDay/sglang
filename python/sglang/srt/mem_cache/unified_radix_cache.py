@@ -508,6 +508,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.load_cache_event = threading.Event()
         self.sidecar_pool_specs.clear()
         self.extra_metric_labels = server_args.extra_metric_labels
+        self.served_model_name = server_args.served_model_name
 
         # Parse storage config once, share with assembler and tree
         storage_backend = server_args.hicache_storage_backend
@@ -2101,7 +2102,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 codes[insert_result.prefix_len // self.page_size :],
                 self.page_size,
             )
-            if self.enable_storage_metrics and self.storage_metrics_collector is not None:
+            if (
+                self.enable_storage_metrics
+                and self.storage_metrics_collector is not None
+            ):
                 cp_rank, _ = self.cache_controller.get_attn_cp_rank_and_size()
                 observed = getattr(
                     self.storage_metrics_collector, "log_prefetch_stages", None
@@ -2333,6 +2337,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self.cache_controller.get_attn_cp_rank_and_size()
             )
             labels = {
+                "model_name": self.served_model_name,
                 "storage_backend": storage_backend,
                 "tp_rank": self.cache_controller.tp_rank,
                 "dp_rank": self.cache_controller.dp_rank,

@@ -179,6 +179,110 @@ def connector_methods():
     return namespace["MooncakeStore"]
 
 
+@pytest.mark.parametrize(
+    "filename,class_name",
+    [
+        ("hiradix_cache.py", "HiRadixCache"),
+        ("unified_radix_cache.py", "UnifiedRadixCache"),
+    ],
+)
+def test_actual_storage_exporter_labels_include_served_model(
+    monkeypatch, filename, class_name
+):
+    from functools import partial
+    from types import SimpleNamespace
+
+    from prometheus_client import Counter, Histogram
+
+    monkeypatch.setitem(
+        sys.modules, "sglang.srt.observability.cache_reuse", cache_reuse
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.server_args",
+        SimpleNamespace(get_global_server_args=lambda: SimpleNamespace()),
+    )
+    registry = CollectorRegistry()
+    metrics_path = source.with_name("metrics_collector.py")
+    metrics_tree = ast.parse(metrics_path.read_text())
+    collector_node = next(
+        node
+        for node in metrics_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "StorageMetricsCollector"
+    )
+    collector_node.bases = []
+    namespace = {}
+    future_annotations = ast.ImportFrom(
+        module="__future__", names=[ast.alias(name="annotations")], level=0
+    )
+    module = ast.Module(body=[future_annotations, collector_node], type_ignores=[])
+    eval(
+        compile(ast.fix_missing_locations(module), str(metrics_path), "exec"), namespace
+    )
+    collector = namespace["StorageMetricsCollector"]
+    collector._counter_cls = partial(Counter, registry=registry)
+    collector._histogram_cls = partial(Histogram, registry=registry)
+    radix_path = source.parents[1] / "mem_cache" / filename
+    radix_tree = ast.parse(radix_path.read_text())
+    radix_node = next(
+        node
+        for node in radix_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    method = next(
+        node
+        for node in radix_node.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_apply_storage_runtime_config"
+    )
+    namespace.update(
+        StorageMetricsCollector=collector,
+        STAT_LOGGER_ROLE_STORAGE="storage",
+        resolve_collector_class=lambda args, role, default: default,
+    )
+    module = ast.Module(body=[future_annotations, method], type_ignores=[])
+    eval(compile(ast.fix_missing_locations(module), str(radix_path), "exec"), namespace)
+    instance = SimpleNamespace(
+        served_model_name="served-model-fixture",
+        storage_metrics_collector=None,
+        page_size=16,
+        cache_controller=SimpleNamespace(
+            tp_rank=0,
+            dp_rank=0,
+            pp_rank=0,
+            pp_size=1,
+            get_attn_cp_rank_and_size=lambda: (0, 1),
+        ),
+    )
+    options = dict(
+        storage_backend="mooncake",
+        prefetch_threshold=256,
+        hicache_storage_pass_prefix_keys=False,
+        enable_storage=True,
+        enable_storage_metrics=True,
+        extra_metric_labels={"custom": "fixture"},
+    )
+    if filename == "hiradix_cache.py":
+        options["prefetch_timeout_config"] = SimpleNamespace()
+    else:
+        options.update(prefetch_timeout_base=1.0, prefetch_timeout_per_ki_token=0.25)
+    namespace[method.name](instance, **options)
+    actual = instance.storage_metrics_collector
+    assert actual.labels["model_name"] == "served-model-fixture"
+    actual.log_prefetch_stages(10, 8, 6, 4)
+    stages = [
+        sample
+        for family in registry.collect()
+        for sample in family.samples
+        if sample.name == "sglang:storage_prefetch_stage_tokens_total"
+    ]
+    assert len(stages) == 4
+    assert all(
+        sample.labels["model_name"] == "served-model-fixture" for sample in stages
+    )
+    assert all(sample.labels["custom"] == "fixture" for sample in stages)
+
+
 def test_actual_connector_preserves_old_sdk_and_fails_unknown():
     import sys
     from types import SimpleNamespace
